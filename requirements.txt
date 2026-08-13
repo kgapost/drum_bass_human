@@ -1,0 +1,7 @@
+mido
+numpy
+pretty_midi
+python-rtmidi
+torch
+tqdm
+tkinterdnd2

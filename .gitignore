@@ -1,0 +1,9 @@
+dbh/
+venv/
+.venv/
+__pycache__/
+*.pyc
+cache/
+checkpoints/
+*.pkl
+.DS_Store
