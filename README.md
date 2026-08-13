@@ -111,3 +111,64 @@ args needed.
    dataset -> train) if I want fresh/better auto-segmentation.
 5. Open `drum_bass_studio.py` for the actual humanize-a-song workflow, or
    `groove_finder_ui.py` just to find similar grooves.
+
+## Notes (things that aren't obvious from the commands alone)
+
+**Caches vs. checkpoints - these are NOT interchangeable:**
+
+| Producer | File it makes | Who actually reads it |
+|---|---|---|
+| `drum_humanizer_v3.py --mode cache` | `cache/samples.pkl` (raw training data) | only `drum_humanizer_v3.py --mode train` |
+| `drum_humanizer_v3.py --mode train` | `checkpoints/<run_name>/best.pt` | `drum_humanizer_v3.py --mode infer` **and** `drum_bass_studio.py` |
+| `find_similar_grooves.py --mode index` (or Groove Finder's "Build Index" button) | `cache/groove_index.pkl` | `find_similar_grooves.py --mode query` **and** `groove_finder_ui.py` |
+
+- `drum_bass_studio.py` never builds or touches a cache. It only needs a
+  trained **checkpoint** (`.pt`) from `drum_humanizer_v3.py` and one from
+  `drum_theme_segmentation.py`, picked via its "browse for checkpoint" buttons.
+  If I haven't trained yet, Studio has nothing to load.
+- `groove_finder_ui.py`'s "Build Index" button calls the exact same
+  `build_index()` function as `find_similar_grooves.py --mode index` - it's
+  literally the same `.pkl` format, just built through the GUI instead of the
+  CLI. Either one can build it, either one can load it.
+- At `infer` time, `drum_humanizer_v3.py` reads the model architecture
+  straight out of the checkpoint file - no need to pass `--model_size` etc.
+  again when humanizing.
+
+**Rebuild triggers - some CLI flags are baked into the cache/index at build time,**
+**not applied later at query/train time:**
+- `drum_humanizer_v3.py --mode cache`: `--no_quality_filter`,
+  `--min_velocity_std/range`, `--min_offset_std/range` only take effect when
+  building the cache. Changing them later means rebuilding `cache/samples.pkl`.
+- `find_similar_grooves.py --mode index`: `--min_notes` and the per-instrument
+  velocity floors are baked into the index. Changing them means rebuilding
+  with `--mode index` again - a `--mode query` re-run won't pick up the change.
+
+**Other things worth remembering:**
+- `--synthetic` (on both `drum_humanizer_v3.py` and effectively via
+  `--num_samples` on `drum_theme_segmentation.py`) lets me smoke-test training
+  end-to-end with fake data, no MIDI library needed - useful to sanity check
+  a code change before waiting on a real cache build.
+- `drum_humanizer_v3.py` also has a hidden `--mode grid_search` (not shown in
+  its own usage examples) for sweeping `--grid_batch_sizes` /
+  `--grid_model_sizes` / `--grid_lrs` combos.
+- `--resume <checkpoint>` on both trainers continues training from a saved
+  checkpoint instead of starting over.
+- `find_similar_grooves.py --mode query --exclude_same_family` filters out
+  results whose filename is just a near-duplicate/variation of the query
+  (e.g. "Fill 1" vs "Fill 14") - useful when the top match is trivially the
+  same take as the query.
+- `groove_finder_ui.py`'s audition/playback only makes real sound on
+  **Windows** (it drives the built-in Microsoft GS Wavetable Synth through
+  `mido`/`python-rtmidi`). It was built/tested in a headless Linux sandbox, so
+  the UI and matching logic work everywhere, but actual audio needs Windows.
+- `config.py` tags each constant as a `JUDGMENT CALL` (developer intuition,
+  fine to retune by feel) vs. `VERIFIED FINDING` / `HARD TECHNICAL CONSTRAINT`
+  (derived from something real - don't casually change without re-checking
+  why it's there).
+- This machine has no NVIDIA GPU (`torch.cuda.is_available()` is `False` -
+  Intel iGPU only), so training runs on CPU. Works, just slow - budget more
+  time for `--mode train` runs than a CUDA box would need.
+- The `dbh` venv is set as this workspace's default interpreter (see
+  `drum_bass_human.code-workspace`), so a fresh VS Code terminal should
+  already have it active - no need to `source dbh/bin/activate` manually
+  unless running from a plain shell outside VS Code.
