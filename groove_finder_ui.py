@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
- GROOVE FINDER — desktop UI for find_similar_grooves.py  (Windows)
+ GROOVE FINDER - desktop UI for find_similar_grooves.py  (Windows)
 ==============================================================================
 
 WHAT THIS IS
@@ -13,13 +13,13 @@ and audition any of them WITHOUT leaving the app or losing window focus.
 AUDITION: HOW PLAYBACK WORKS (no external program, no bundled soundfont)
 --------------------------------------------------------------------------
 Windows ships a built-in General MIDI software synth ("Microsoft GS Wavetable
-Synth") that is always available as a MIDI output device — no install needed.
+Synth") that is always available as a MIDI output device - no install needed.
 This app talks to it DIRECTLY over Python's MIDI I/O (via `mido` + the
 `python-rtmidi` backend), sending the file's note events to it in real time
 on a background thread. That means:
   • No separate program window opens (nothing steals focus).
   • Real General MIDI drum-kit sounds (kick/snare/hats/etc.), not a beep.
-  • Audio quality is whatever that built-in synth sounds like — this
+  • Audio quality is whatever that built-in synth sounds like - this
     deliberately trades fidelity for staying in-process and simple.
 The Audition button toggles to a Stop button while playing; Stop immediately
 halts playback and sends an all-notes-off safety message so nothing hangs.
@@ -29,7 +29,7 @@ REQUIREMENTS (Windows)
   pip install pretty_midi numpy mido python-rtmidi tkinterdnd2
   (tkinter itself ships with the standard python.org Windows installer)
 
-This file must sit in the SAME FOLDER as find_similar_grooves.py — it imports
+This file must sit in the SAME FOLDER as find_similar_grooves.py - it imports
 that module directly rather than duplicating its logic.
 
 HOW TO USE
@@ -49,7 +49,7 @@ exist. The playback engine was verified against a mock MIDI output (message
 order, channel handling, stop responsiveness, no-stuck-notes), and the GUI
 was verified under a virtual display (widgets build, state transitions fire
 correctly). Actual audible sound and actual drag-and-drop from Windows
-Explorer need to be confirmed on your machine — see the summary for specifics.
+Explorer need to be confirmed on your machine - see the summary for specifics.
 """
 
 import os
@@ -90,11 +90,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import find_similar_grooves as fsg
 except ImportError as exc:
-    print(f"FATAL: could not import find_similar_grooves.py — make sure it is "
+    print(f"FATAL: could not import find_similar_grooves.py - make sure it is "
           f"in the same folder as this script. ({exc})")
     sys.exit(1)
 
-# drum_theme_segmentation.py is OPTIONAL — the app works fully without it, just
+# drum_theme_segmentation.py is OPTIONAL - the app works fully without it, just
 # without the segment-timeline feature (needs torch, which isn't otherwise required).
 try:
     import drum_theme_segmentation as dts
@@ -122,7 +122,7 @@ def _error_location(exc: BaseException) -> str:
 
 def _report_error(context: str, exc: BaseException) -> str:
     loc = _error_location(exc)
-    msg = f"{context}\n→ {type(exc).__name__} at {loc}: {exc}"
+    msg = f"{context}\n-> {type(exc).__name__} at {loc}: {exc}"
     print(f"[ERROR] {msg}")
     return msg
 
@@ -131,7 +131,7 @@ def _report_error(context: str, exc: BaseException) -> str:
 # PERSISTENT SETTINGS  (remember the last-used index / model across restarts)
 # =============================================================================
 # DESIGN: building/pointing the app at an index is meant to be a ONE-TIME setup
-# step — the index itself is already saved to disk by build_index(). Without
+# step - the index itself is already saved to disk by build_index(). Without
 # this, though, the APP would still forget where that file is every time it's
 # relaunched, forcing a manual "Load Index..." every session. This small JSON
 # file (kept next to the script) closes that gap: whatever index/model loaded
@@ -163,7 +163,7 @@ def _save_persisted_settings(**kv):
 
 def _tempo_at_time(pm, t: float) -> float:
     """Return the tempo (bpm) actually in effect at absolute time t, tempo-change
-    aware — the LAST tempo change at or before t, not blindly the file's first."""
+    aware - the LAST tempo change at or before t, not blindly the file's first."""
     try:
         times, tempi = pm.get_tempo_changes()
     except Exception:
@@ -184,14 +184,14 @@ def _tempo_at_time(pm, t: float) -> float:
 # =============================================================================
 # DESIGN: the output port is an INJECTED dependency (anything with a .send(msg)
 # method works) specifically so this class can be unit-tested with a mock
-# recorder instead of real MIDI hardware — see the test suite at the bottom of
+# recorder instead of real MIDI hardware - see the test suite at the bottom of
 # this file. On a real Windows machine, `mido.open_output()` with no argument
 # name opens the system default port, which is the built-in GS Wavetable Synth.
 
 class MidiPlayer:
     """Plays one MIDI file at a time on a background thread. Forces all note
     events onto MIDI channel 10 (GM drum channel) so playback always uses the
-    synth's drum kit sounds regardless of the source file's original channel —
+    synth's drum kit sounds regardless of the source file's original channel -
     SD3-exported grooves are drums-only files, so this is always correct here."""
 
     DRUM_CHANNEL = 9   # 0-indexed == "channel 10" in 1-indexed MIDI terminology
@@ -208,18 +208,18 @@ class MidiPlayer:
     @staticmethod
     def _default_outport_factory():
         if not HAS_MIDO:
-            raise RuntimeError("mido is not installed — run: pip install mido python-rtmidi")
+            raise RuntimeError("mido is not installed - run: pip install mido python-rtmidi")
         try:
             names = mido.get_output_names()
         except Exception as exc:
             raise RuntimeError(f"could not list MIDI output ports ({exc}). Is "
                                f"python-rtmidi installed? (pip install python-rtmidi)")
         if not names:
-            raise RuntimeError("no MIDI output ports found on this system — "
+            raise RuntimeError("no MIDI output ports found on this system - "
                                "Windows should always have 'Microsoft GS Wavetable "
                                "Synth'; check Windows Sound settings / MIDI devices.")
         # DESIGN: prefer the built-in Windows synth by name if it's present, rather
-        # than trusting whichever port happens to enumerate first — a machine with
+        # than trusting whichever port happens to enumerate first - a machine with
         # other MIDI hardware/software installed could otherwise route audition
         # to something unexpected (or silent).
         preferred = next((n for n in names if 'gs wavetable' in n.lower()), None)
@@ -236,7 +236,7 @@ class MidiPlayer:
         is called (from the playback thread) when playback ends, whether by
         completing naturally, being stopped, or erroring.
         tempo_scale: uniformly speeds up (>1) or slows down (<1) the WHOLE
-        performance's timing — e.g. 1.5 plays 50% faster. Used to retime a
+        performance's timing - e.g. 1.5 plays 50% faster. Used to retime a
         library groove to the query's tempo when auditioning it; leave at 1.0
         (default) to play a file at its own native tempo, unchanged."""
         if self.is_playing:
@@ -260,7 +260,7 @@ class MidiPlayer:
             port = self._ensure_port()
             midi = mido.MidiFile(path)
             # DESIGN: mido.MidiFile.play() sleeps INSIDE its generator between
-            # messages, so the stop flag would only be checked once per message —
+            # messages, so the stop flag would only be checked once per message -
             # a groove with a longer gap between hits could make Stop take as long
             # as that gap to respond. We track absolute time ourselves and sleep in
             # SMALL (15ms) increments, checking the stop flag between every
@@ -272,7 +272,7 @@ class MidiPlayer:
             for msg in mido.merge_tracks(midi.tracks):
                 elapsed_ticks += msg.time   # delta in ticks
                 # DESIGN: tempo_scale rescales the WHOLE performance's timing axis
-                # uniformly (not the file's own embedded tempo value itself) — this
+                # uniformly (not the file's own embedded tempo value itself) - this
                 # preserves the groove's internal feel/swing exactly, just played
                 # faster or slower to land on a different target tempo.
                 target_time = mido.tick2second(elapsed_ticks, midi.ticks_per_beat, tempo) / tempo_scale
@@ -326,7 +326,7 @@ class MidiPlayer:
 # UI APPLICATION
 # =============================================================================
 # DESIGN: every find_similar_grooves.py CLI argument is exposed as a live
-# control here — the two INDEX-time args (data_dir/cache/num_workers/min_notes/
+# control here - the two INDEX-time args (data_dir/cache/num_workers/min_notes/
 # 5 velocity floors) live in a "Build New Index" panel; the QUERY-time args
 # (top_k/exclude_same_family/7 weights) live in a "Query Settings" panel. Both
 # panels sit in a Settings dialog reachable from the main window, since ~15
@@ -335,13 +335,13 @@ class MidiPlayer:
 # "Search Again" without re-dropping the query file.
 #
 # Query computation, index loading/building, and playback start/stop ALL run
-# on background threads and hand results back via `root.after(0, ...)` — the
-# standard safe pattern for touching Tkinter widgets from a worker thread —
+# on background threads and hand results back via `root.after(0, ...)` - the
+# standard safe pattern for touching Tkinter widgets from a worker thread -
 # so nothing in this app can freeze the window.
 
 RESULTS_LIMIT_DEFAULT = 10
 
-# Qualitative palette for the segment timeline — distinguishable, cycles if there
+# Qualitative palette for the segment timeline - distinguishable, cycles if there
 # are more segments than colors.
 SEGMENT_COLORS = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2',
                   '#937860', '#DA8BC3', '#8C8C8C', '#CCB974', '#64B5CD']
@@ -369,7 +369,7 @@ class GrooveFinderApp:
         self.seg_cfg = None
         self.seg_checkpoint_path: Optional[str] = None
         self.current_full_query_path: Optional[str] = None   # the ORIGINAL dropped
-        # file — distinct from last_query_path, which may point at a segment's
+        # file - distinct from last_query_path, which may point at a segment's
         # sliced temp file. Lets the "Whole File" button always get back to it.
         self.whole_file_tempo: Optional[float] = None   # tempo at t=0 of that file
         self.segments: List[Dict] = []
@@ -378,7 +378,7 @@ class GrooveFinderApp:
         self.temp_dir = tempfile.mkdtemp(prefix='groove_finder_')
 
         # ── Query-time controls: every Config query-weight field + top_k +
-        # exclude_same_family. Live Tk variables — read fresh on every search. ──
+        # exclude_same_family. Live Tk variables - read fresh on every search. ──
         _d = fsg.Config()
         self.var_top_k               = tk.IntVar(value=RESULTS_LIMIT_DEFAULT)
         self.var_exclude_same_family = tk.BooleanVar(value=False)
@@ -438,7 +438,7 @@ class GrooveFinderApp:
         self.dnd_active = False
         if HAS_DND:
             # DESIGN: a successful `import tkinterdnd2` only proves the Python
-            # package is installed — the underlying tkdnd Tcl extension can still
+            # package is installed - the underlying tkdnd Tcl extension can still
             # fail to register on some systems (version/platform quirks). Drag-
             # and-drop is a nicety with a working click-to-browse fallback, so a
             # failure here must degrade gracefully, never crash the whole app.
@@ -534,7 +534,7 @@ class GrooveFinderApp:
             hint = ttk.Frame(nb)
             nb.add(hint, text="Segmentation")
             ttk.Label(hint, text="drum_theme_segmentation.py (and torch) were not "
-                     "found — segment-timeline is disabled.\nEverything else works "
+                     "found - segment-timeline is disabled.\nEverything else works "
                      "normally.", foreground='gray', wraplength=400,
                      justify='left').pack(padx=12, pady=12)
 
@@ -728,7 +728,7 @@ class GrooveFinderApp:
 
     def _on_build_index_done(self, cache_path):
         self.build_btn.config(state='normal')
-        self._set_status(f"Index built → {cache_path}", busy=False)
+        self._set_status(f"Index built -> {cache_path}", busy=False)
         if messagebox.askyesno("Index built", f"Index built successfully:\n{cache_path}\n\n"
                                f"Load it now?"):
             self._set_status("Loading index...", busy=True)
@@ -791,7 +791,7 @@ class GrooveFinderApp:
             messagebox.showinfo("No query yet", "Drop or browse a query MIDI file first.")
             return
         # re-run with the SAME target (whole file or whichever segment was last
-        # searched) — never re-triggers segmentation or resets the timeline
+        # searched) - never re-triggers segmentation or resets the timeline
         label = None
         if self.active_segment_index is not None and self.active_segment_index < len(self.segments):
             s = self.segments[self.active_segment_index]
@@ -826,7 +826,7 @@ class GrooveFinderApp:
             self.current_full_query_path = query_path
             self.whole_file_btn.config(state='disabled')
             self._clear_segments()
-            # cache the tempo at the start of the file — used to retime RESULT
+            # cache the tempo at the start of the file - used to retime RESULT
             # audition to the query's tempo when no segment is selected.
             self.whole_file_tempo = None
             if HAS_PRETTY_MIDI:
@@ -842,7 +842,7 @@ class GrooveFinderApp:
             cfg = fsg.Config(**{k: v for k, v in self.index['cfg'].items()
                                 if k in fsg.Config.__dataclass_fields__})
             # apply the LIVE query-time overrides (weights/top_k/exclude) on top
-            # of the index-baked cfg — same override pattern query_similar() uses
+            # of the index-baked cfg - same override pattern query_similar() uses
             for field in ('weight_rhythm', 'weight_velocity', 'weight_density',
                          'weight_tempo', 'weight_hihat_pattern', 'weight_tom_pattern',
                          'weight_cymbal_pattern'):
@@ -850,7 +850,7 @@ class GrooveFinderApp:
 
             query_fp = fsg.extract_fingerprint(query_path, cfg)
             if query_fp is None:
-                raise ValueError("Could not extract a fingerprint — parse failure "
+                raise ValueError("Could not extract a fingerprint - parse failure "
                                  "or too few drum notes in this file/section.")
             sims = fsg.compute_similarities(query_fp, self.index, cfg)
             order = np.argsort(-sims)
@@ -922,7 +922,7 @@ class GrooveFinderApp:
             total_measures = result['total_measures']
             midi = result['midi']
             # DESIGN: tempo-change-AWARE conversion (handles a query file with a
-            # mid-file tempo change correctly) — NOT a naive constant sec_per_bar,
+            # mid-file tempo change correctly) - NOT a naive constant sec_per_bar,
             # which would silently misplace every boundary after the change.
             segments = []
             for i, start_bar in enumerate(starts):
@@ -935,7 +935,7 @@ class GrooveFinderApp:
                     'start_sec': start_sec,
                     'end_sec': dts.bar_to_seconds(end_bar, midi, self.seg_cfg),
                     # tempo ACTUALLY active at this segment's start (not blindly the
-                    # file's first tempo) — this is what result-groove audition gets
+                    # file's first tempo) - this is what result-groove audition gets
                     # rescaled to match, so it sounds right even after a mid-file
                     # tempo change in the query itself.
                     'tempo': _tempo_at_time(midi, start_sec),
@@ -1033,7 +1033,7 @@ class GrooveFinderApp:
             raise RuntimeError("pretty_midi is required to slice segments.")
         src = pretty_midi.PrettyMIDI(source_path)
         # DESIGN: use the tempo actually ACTIVE at this segment's start time, not
-        # blindly the file's first tempo — a file that changes tempo partway
+        # blindly the file's first tempo - a file that changes tempo partway
         # through would otherwise tag every later segment with the wrong tempo,
         # misleading the --weight_tempo similarity comparison for that search.
         tempo = _tempo_at_time(src, start_sec)
@@ -1068,7 +1068,7 @@ class GrooveFinderApp:
         selected_path = self.results[idx]['path']
         # If a RESULT is already playing and the user picked a DIFFERENT row,
         # seamlessly switch playback to the new one (per spec, no extra click).
-        # A currently-playing SEGMENT audition is left alone — only another
+        # A currently-playing SEGMENT audition is left alone - only another
         # result-row selection or the segment button itself should affect it.
         if (self.playing_source == 'result' and self.playing_path is not None
                 and selected_path != self.playing_path):
@@ -1092,7 +1092,7 @@ class GrooveFinderApp:
         idx = int(sel[0])
         result_path = self.results[idx]['path']
 
-        # DESIGN: filename = {query}-{segment_no}-{similar_groove}.mid — the query
+        # DESIGN: filename = {query}-{segment_no}-{similar_groove}.mid - the query
         # name always comes from the ORIGINAL dropped file (current_full_query_path),
         # never a segment's generated temp-file name, since that's what "$query_
         # filename$" means to a user. segment_no is 1-indexed to match how segments
@@ -1118,7 +1118,7 @@ class GrooveFinderApp:
             msg = _report_error(f"saving '{result_path}' to '{dest}'", exc)
             messagebox.showerror("Save failed", msg)
             return
-        self._set_status(f"Saved → {os.path.basename(dest)}", busy=False)
+        self._set_status(f"Saved -> {os.path.basename(dest)}", busy=False)
 
     def _on_segment_audition_clicked(self):
         if self.active_segment_temp_path is None:
@@ -1129,7 +1129,7 @@ class GrooveFinderApp:
             self._start_playback(self.active_segment_temp_path, 'segment')
 
     def _current_query_tempo(self) -> Optional[float]:
-        """Tempo (bpm) that RESULT-groove audition should be retimed to match —
+        """Tempo (bpm) that RESULT-groove audition should be retimed to match -
         the active segment's own tempo if one is selected, else the whole query
         file's tempo at its start. None if unknown (no query loaded yet)."""
         if self.active_segment_index is not None and self.active_segment_index < len(self.segments):
@@ -1140,7 +1140,7 @@ class GrooveFinderApp:
 
     def _start_playback(self, path, source):
         # Both audition buttons share ONE MidiPlayer (only one output port, only
-        # one thing can really be sounding at a time) — starting either kind of
+        # one thing can really be sounding at a time) - starting either kind of
         # playback stops whatever the other one was doing and resets ITS button.
         self.playing_path = path
         self.playing_source = source
@@ -1152,7 +1152,7 @@ class GrooveFinderApp:
             self.audition_btn.config(text="▶ Audition")
 
         # RETEMPO a result groove to the query's (segment's or whole-file's) tempo
-        # — a segment/whole-file audition is already at the query's own tempo, so
+        # - a segment/whole-file audition is already at the query's own tempo, so
         # it never needs rescaling. A missing tempo on either side (e.g. tempo
         # couldn't be read) safely falls back to 1.0 = play at native tempo.
         tempo_scale = 1.0
@@ -1223,7 +1223,7 @@ def main():
     if root is None:
         root = tk.Tk()
         if not HAS_DND:
-            print("(tkinterdnd2 not installed — drag-and-drop disabled, "
+            print("(tkinterdnd2 not installed - drag-and-drop disabled, "
                   "click-to-browse still works: pip install tkinterdnd2)")
     GrooveFinderApp(root)
     root.mainloop()

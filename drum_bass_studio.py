@@ -10,15 +10,15 @@ A single-window tool that takes a full song's drum MIDI (and its matching bass
 MIDI), segments the drums into themes, and lets you polish each segment
 through three phases:
 
-  Phase 1  DRUM HUMANIZE     — run the trained humanizer model on this segment.
-  Phase 2  RUSH / DRAG       — manually nudge syncopated hits earlier/later,
+  Phase 1  DRUM HUMANIZE     - run the trained humanizer model on this segment.
+  Phase 2  RUSH / DRAG       - manually nudge syncopated hits earlier/later,
                                 and optionally pull the strong beats back to
                                 the grid, per instrument group.
-  Phase 3  BASS SYNC         — lock nearby bass notes to the (now-humanized)
+  Phase 3  BASS SYNC         - lock nearby bass notes to the (now-humanized)
                                 kick/snare, with a small randomized delay so
                                 the two transients stay audibly distinct.
 
-Every phase's settings are remembered PER SEGMENT — select a different
+Every phase's settings are remembered PER SEGMENT - select a different
 segment, adjust it, come back, and your earlier settings are exactly as you
 left them. Phases are gated (Phase 2 needs Phase 1's output to adjust; Phase 3
 needs Phase 2's output to sync against) but NEVER re-lock: revisit an earlier
@@ -27,11 +27,11 @@ result the next time you preview or render it.
 
 REUSED FROM THE OTHER PROJECT SCRIPTS (see their own docstrings for detail)
 ------------------------------------------------------------------------------
-  drum_humanizer_v3.py        — Phase 1's model (humanize_file), DrumEvent,
+  drum_humanizer_v3.py        - Phase 1's model (humanize_file), DrumEvent,
                                  the MIDI grid/Config, load/write helpers.
-  drum_theme_segmentation.py  — the segmentation model (compute_segment_
+  drum_theme_segmentation.py  - the segmentation model (compute_segment_
                                  boundaries, bar_to_seconds).
-  groove_finder_ui.py         — MidiPlayer (in-process MIDI playback engine),
+  groove_finder_ui.py         - MidiPlayer (in-process MIDI playback engine),
                                  tempo helpers, error-reporting, and the
                                  persisted-settings pattern.
 Phase 2 and Phase 3's actual signal processing, and the whole window, are new.
@@ -41,7 +41,7 @@ HOW IT IS USED
   pip install torch pretty_midi mido numpy
   python drum_bass_studio.py
 Then, in the window: drop a drum MIDI (top), drop the matching bass MIDI
-(below it), click a segment, work through Phase 1 → 2 → 3, repeat for other
+(below it), click a segment, work through Phase 1 -> 2 -> 3, repeat for other
 segments, then hit "Render Song" to write the final processed drum + bass
 files.
 
@@ -101,7 +101,7 @@ except ImportError:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-# Every constant lives in config.py (kept alongside this script) — see that
+# Every constant lives in config.py (kept alongside this script) - see that
 # file's header for why, and for the full reasoning behind each value.
 from config import (
     CUSTOMIZED_MARKER_COLOR, GLOBAL_SEED, GROUP_KICK, GROUP_OTHER, GROUP_SNARE,
@@ -146,7 +146,7 @@ def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
     DESIGN: same approach as groove_finder_ui.py's _slice_segment_to_temp,
     generalized to work for either the drum file (drums_only=True, since a
     stray non-drum track should never leak in) or the bass file (drums_only=
-    False — a bass track is not marked is_drum in a MIDI file).
+    False - a bass track is not marked is_drum in a MIDI file).
     """
     if not HAS_PRETTY_MIDI:
         raise RuntimeError("pretty_midi is required to slice segments.")
@@ -177,7 +177,7 @@ def _report_error(context: str, exc: BaseException) -> str:
 
 
 # =============================================================================
-# PHASE 1 — DRUM HUMANIZE  (thin, tested reuse of drum_humanizer_v3.humanize_file)
+# PHASE 1 - DRUM HUMANIZE  (thin, tested reuse of drum_humanizer_v3.humanize_file)
 # =============================================================================
 
 def run_phase1_humanize(checkpoint: str, input_path: str, output_path: str,
@@ -202,7 +202,7 @@ def run_phase1_humanize(checkpoint: str, input_path: str, output_path: str,
 
 
 # =============================================================================
-# PHASE 2 — MANUAL RUSH / DRAG + QUANTIZE
+# PHASE 2 - MANUAL RUSH / DRAG + QUANTIZE
 # =============================================================================
 # DESIGN: classify each note by its position WITHIN its beat, on the
 # humanizer's own fine grid (cfg.grid_resolution steps per beat). A 16th-note
@@ -214,13 +214,13 @@ def run_phase1_humanize(checkpoint: str, input_path: str, output_path: str,
 #   sixteenth_in_beat 3 -> "a"        -> RUSH/DRAG, full strength
 # Beats 1 & 3 (0-indexed 0,2) -> QUANTIZE target ("the main beats").
 # Beats 2 & 4 (0-indexed 1,3) -> RUSH/DRAG target too, but DAMPED
-# (PHASE2_WEAK_BEAT_DAMPING) — "the 2 and the 4" always included, per spec,
+# (PHASE2_WEAK_BEAT_DAMPING) - "the 2 and the 4" always included, per spec,
 # always at a reduced effect relative to e/a.
 
 def classify_phase2_role(grid_step: int, cfg) -> str:
     """Returns 'strong_beat' (1,3 -> quantize target), 'syncopation' (e,a ->
     full rush/drag), 'weak_beat' (2,4 -> damped rush/drag), or 'none' (the
-    "&"/and position, or an off-16th-grid note — untouched either way)."""
+    "&"/and position, or an off-16th-grid note - untouched either way)."""
     fine_per_16th = max(1, cfg.grid_resolution // 4)
     beat_in_bar = (grid_step // cfg.grid_resolution) % cfg.beats_per_bar
     fine_in_beat = grid_step % cfg.grid_resolution
@@ -272,10 +272,10 @@ def run_phase2_adjust(input_path: str, output_path: str, settings: Dict, cfg=Non
 
 
 # =============================================================================
-# PHASE 3 — BASS SYNC TO DRUMS
+# PHASE 3 - BASS SYNC TO DRUMS
 # =============================================================================
 # DESIGN: works entirely in ABSOLUTE TIME (seconds) via plain pretty_midi, on
-# BOTH sides — never through drum_humanizer_v3's grid+offset representation.
+# BOTH sides - never through drum_humanizer_v3's grid+offset representation.
 # This sidesteps the round-trip-reassignment risk documented above (Phase 3
 # only ever READS the processed drum file, never writes it back through the
 # grid loader), and it's the natural representation for bass notes anyway
@@ -313,7 +313,7 @@ def run_phase3_sync(processed_drum_path: str, bass_path: str, output_bass_path: 
     A bass note within PHASE3_SNAP_THRESHOLD_BEATS of the nearest kick/snare
     hit is pulled toward it, proportional to snap_strength (0=untouched,
     1=exact snap). EVERY bass note then gets a small random post-hit delay
-    (see _interpolated_delay_range_ms) so the two transients stay distinct —
+    (see _interpolated_delay_range_ms) so the two transients stay distinct -
     applied unconditionally, not just to snapped notes, per spec.
     """
     rng = rng or random.Random(GLOBAL_SEED)
@@ -361,12 +361,12 @@ def run_phase3_sync(processed_drum_path: str, bass_path: str, output_bass_path: 
 # =============================================================================
 # PER-SEGMENT STATE
 # =============================================================================
-# DESIGN: "never re-lock" — a phase's settings/output are independent instance
+# DESIGN: "never re-lock" - a phase's settings/output are independent instance
 # state, always re-derivable from the phase before it. Gating only controls
 # whether a phase's CONTROLS are enabled (has the prior phase been run at
 # least once for this segment?), never whether they can be revisited. Reopening
 # Phase 1 after Phase 2/3 were already applied does NOT wipe those downstream
-# results — they simply become STALE (flagged in the UI) until re-applied,
+# results - they simply become STALE (flagged in the UI) until re-applied,
 # which always recomputes from whatever Phase 1's CURRENT output now is.
 
 def default_phase1_settings() -> Dict:
@@ -389,7 +389,7 @@ def default_phase3_settings() -> Dict:
 @dataclass
 class SegmentSettings:
     """Everything remembered for ONE segment. `stale` flags mean "the phase
-    before this one changed since I was last computed" — shown in the UI as a
+    before this one changed since I was last computed" - shown in the UI as a
     hint to re-apply, never auto-recomputed (that could mean silently re-
     running the Phase 1 MODEL on every minor slider tweak elsewhere)."""
     index: int

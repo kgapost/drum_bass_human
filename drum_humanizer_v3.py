@@ -1,12 +1,12 @@
 """
 ==============================================================================
- MIDI DRUM HUMANIZATION TRANSFORMER  (v3 — encoder-only)
+ MIDI DRUM HUMANIZATION TRANSFORMER  (v3 - encoder-only)
 ==============================================================================
 
 WHAT THIS PROGRAM DOES
 ----------------------
-It learns how a HUMAN drummer plays — the micro-timing pushes/pulls and the
-velocity dynamics — from a corpus of human-performed MIDI drums (built for the
+It learns how a HUMAN drummer plays - the micro-timing pushes/pulls and the
+velocity dynamics - from a corpus of human-performed MIDI drums (built for the
 Superior Drummer 3 groove library) and then applies that "feel" to stiff,
 quantized, programmed MIDI. It learns entirely from data: there are NO
 hand-written "make it swing" rules (with ONE optional, explicitly-labelled
@@ -26,7 +26,7 @@ and a de-humanized (quantized + velocity-coarsened) copy is the INPUT. The model
 learns to turn stiff back into human. Faithful reconstruction re-uses each hit's
 exact original pitch so notes are never altered.
 
-HOW IT IS USED — THREE MODES
+HOW IT IS USED - THREE MODES
 ----------------------------
   1) cache : parse a folder of MIDI files once into a fast training cache.
   2) train : train a model on that cache (or on --synthetic data for a smoke test).
@@ -91,7 +91,7 @@ INFER MODE
   --checkpoint PATH            trained model (best.pt); architecture read from it
   --input FILE                 MIDI to humanize
   --output FILE                where to write the humanized MIDI
-  --strength X                 how far to move dry→model: 0=none, 1=model, >1=exaggerate
+  --strength X                 how far to move dry->model: 0=none, 1=model, >1=exaggerate
   --strength_velocity X        override --strength for velocity only
   --strength_timing X          override --strength for timing only
   --temperature_vel X / --temperature_off X    sampling temperature per head
@@ -126,8 +126,8 @@ TWO PREDICTION PARADIGMS  (--target_mode)
   4.  --strength extrapolation beyond 1.0, so you can exaggerate the model's
       humanization past what it predicts, with safety clamps.
   5.  Removed the note-changing / cymbal-swap feature entirely, because altering
-      which notes you played is too dangerous — pitch is now always preserved.
-  6.  Progressive --model_size presets (tiny→huge) so you can chase a drummer's
+      which notes you played is too dangerous - pitch is now always preserved.
+  6.  Progressive --model_size presets (tiny->huge) so you can chase a drummer's
       long-range intuition with more depth, with dropout scaled up to fight overfit.
   7.  Grid-distance preservation: notes already off-grid (already humanized) get
       less model timing-influence, so baked-in feel in the input is protected.
@@ -151,8 +151,8 @@ TWO PREDICTION PARADIGMS  (--target_mode)
   17. Bar-rotation augmentation: drop the first 2/4/8 bars (for grooves ≥4/≥8/≥16
       bars) so the model doesn't over-index on phrase openings; input+target stay
       aligned so the humanization target is never corrupted.
-  18. Richer training progress output: dataset provenance (original files → split
-      section-samples → augmented) plus an in-place per-batch counter every 10 batches.
+  18. Richer training progress output: dataset provenance (original files -> split
+      section-samples -> augmented) plus an in-place per-batch counter every 10 batches.
 
 Search the source for "DESIGN:" to find inline rationale for any decision above.
 """
@@ -190,7 +190,7 @@ try:
     HAS_PRETTY_MIDI = True
 except ImportError:
     HAS_PRETTY_MIDI = False
-    print("Warning: pretty_midi not installed — real MIDI I/O disabled. "
+    print("Warning: pretty_midi not installed - real MIDI I/O disabled. "
           "Install with: pip install pretty_midi")
 
 try:
@@ -201,7 +201,7 @@ except ImportError:
 
 
 # =============================================================================
-# REPRODUCIBILITY — single seed for ALL random number generators
+# REPRODUCIBILITY - single seed for ALL random number generators
 # =============================================================================
 GLOBAL_SEED = 42
 
@@ -227,7 +227,7 @@ def seed_everything(seed: int = GLOBAL_SEED, verbose: bool = True):
 
 def _worker_init_fn(worker_id: int):
     """
-    DataLoader worker seeding. Each worker is a separate process — without this,
+    DataLoader worker seeding. Each worker is a separate process - without this,
     workers can inherit correlated or platform-dependent RNG state instead of a
     reproducible one. Derive a distinct-but-deterministic seed per worker from the
     single global seed, so the whole pipeline stays reproducible under multiprocessing.
@@ -239,7 +239,7 @@ def _worker_init_fn(worker_id: int):
 
 # Seed everything at IMPORT time, not just inside main(). This covers using the
 # module as a library (`import drum_humanizer_v3 as D`) without going through the
-# CLI — e.g. calling D.train(...)/D.generate_synthetic_events(...) directly in a
+# CLI - e.g. calling D.train(...)/D.generate_synthetic_events(...) directly in a
 # notebook or another script. main() still re-seeds explicitly for clarity when run
 # as a program; this line just guarantees the same reproducibility for library use.
 seed_everything(GLOBAL_SEED, verbose=False)
@@ -252,10 +252,10 @@ seed_everything(GLOBAL_SEED, verbose=False)
 # file:line where the error occurred plus a human-readable description of what the
 # program was trying to do. Used at the crucial points (MIDI parsing, training
 # step, checkpoint I/O, inference, top-level dispatch). They deliberately do NOT
-# swallow errors silently — they explain, then either skip one item or re-raise.
+# swallow errors silently - they explain, then either skip one item or re-raise.
 
 def _error_location(exc: BaseException) -> str:
-    """Return 'filename:line in function' for the DEEPEST frame of an exception —
+    """Return 'filename:line in function' for the DEEPEST frame of an exception -
     i.e. the exact line that actually raised, not where it was caught."""
     tb = exc.__traceback__
     last = None
@@ -274,7 +274,7 @@ def _report_error(context: str, exc: BaseException, fatal: bool = False):
     fatal:   if True, also print the full traceback for debugging."""
     loc = _error_location(exc)
     print(f"\n[ERROR] {context}")
-    print(f"        → {type(exc).__name__} at {loc}: {exc}")
+    print(f"        -> {type(exc).__name__} at {loc}: {exc}")
     if fatal:
         print("        Full traceback:")
         traceback.print_exc()
@@ -285,7 +285,7 @@ def _report_error(context: str, exc: BaseException, fatal: bool = False):
 # =============================================================================
 
 # ── Model size presets (progressively deeper) ──────────────────────────────────
-# DESIGN: depth is the main lever for capturing higher-order musical intuition —
+# DESIGN: depth is the main lever for capturing higher-order musical intuition -
 # "this is a build, lean into it" needs the net to relate distant hits across the
 # whole phrase, which more layers do better. But deeper ≠ automatically smarter:
 # with a fixed dataset a bigger model can overfit, so each preset also raises
@@ -327,11 +327,11 @@ class Config:
     num_metric_levels: int = 6      # subdivision-strength classes: downbeat..finer/off
     # Tempo conditioning: micro-timing feel scales with tempo (a +15ms push is lazy at
     # 80bpm, sloppy at 180bpm). We feed normalized tempo so the model can tighten/loosen
-    # timing with speed. Range for normalization → [0,1]:
+    # timing with speed. Range for normalization -> [0,1]:
     tempo_min_bpm:    float = 40.0
     tempo_max_bpm:    float = 240.0
     # Flam / grace-note detection: two same-instrument hits closer than this (in ms)
-    # are a flam/drag/ruff — the micro-gap that DEFINES them would otherwise be
+    # are a flam/drag/ruff - the micro-gap that DEFINES them would otherwise be
     # quantized away. We flag the grace hit and preserve the gap through reconstruction.
     flam_window_ms:   float = 35.0  # same-instrument hits within this = flam
     flam_gap_bins:    int = 12      # quantize the flam gap (0..flam_window_ms) into N bins
@@ -345,14 +345,14 @@ class Config:
     # ── Training-data quality filter ────────────────────────────────────────────
     # A flat, mechanical MIDI teaches the model nothing about humanization (or worse,
     # teaches that "human" == "robotic"). We measure each candidate sample's velocity
-    # spread and timing spread; a sample is REJECTED only if it is flat on BOTH — i.e.
+    # spread and timing spread; a sample is REJECTED only if it is flat on BOTH - i.e.
     # essentially a quantized robotic pattern. If it has real expression in either
     # dimension it is still a useful target for that dimension, so we keep it.
     quality_filter:      bool  = True
-    min_velocity_std:    float = 4.0    # MIDI-velocity units; below → "flat dynamics"
-    min_velocity_range:  float = 12.0   # max-min MIDI velocity; below → "flat dynamics"
-    min_offset_std:      float = 2.0    # ticks; below → "flat/quantized timing"
-    min_offset_range:    float = 6.0    # max-min offset ticks; below → "flat timing"
+    min_velocity_std:    float = 4.0    # MIDI-velocity units; below -> "flat dynamics"
+    min_velocity_range:  float = 12.0   # max-min MIDI velocity; below -> "flat dynamics"
+    min_offset_std:      float = 2.0    # ticks; below -> "flat/quantized timing"
+    min_offset_range:    float = 6.0    # max-min offset ticks; below -> "flat timing"
 
     # ── Bar-rotation augmentation (training only) ───────────────────────────────
     # A model that only ever sees files starting at bar 1 can over-index on phrase
@@ -364,10 +364,10 @@ class Config:
     bar_rotation_prob:   float = 0.6     # chance of applying it to a given sample
     bar_rotation_max:    int   = 2       # max lead bars to drop (only if ≥4 bars total)
 
-    # ── "Smarter network" options (#3,#4,#6,#7,#12) — all toggleable ─────────────
+    # ── "Smarter network" options (#3,#4,#6,#7,#12) - all toggleable ─────────────
     # #4 Relative positional encoding: replace the absolute learned position embedding
     #    with a relative-position attention bias (T5-style buckets), so the model keys
-    #    off musical DISTANCE between hits rather than absolute index → generalises to
+    #    off musical DISTANCE between hits rather than absolute index -> generalises to
     #    unseen phrase lengths/positions. Default ON (near-sure win, cheap).
     rel_pos_encoding:    bool  = True
     rel_pos_buckets:     int   = 32      # number of relative-distance buckets (each side)
@@ -381,7 +381,7 @@ class Config:
     #    the model can hold distinct "personalities" (hats rush, kick sits back). Cheap.
     per_instrument_feel: bool  = True
     # #6 Distribution-matching (regression only): add a spread (log-variance) output so
-    #    the regression head predicts a DISTRIBUTION, not just the mean → less timid.
+    #    the regression head predicts a DISTRIBUTION, not just the mean -> less timid.
     #    Trained with Gaussian NLL. Ignored in classification mode. Default OFF.
     distribution_match:  bool  = False
     # #7 Correlation-aware loss: reward getting the RELATIONSHIP between metric strength
@@ -391,7 +391,7 @@ class Config:
 
     # ── Velocity loss/decoding (matters once bins are fine-grained) ─────────────
     # DESIGN: with 128 fine bins, flat cross-entropy treats bin 100 vs 101 as
-    # "just as wrong" as 100 vs 20 — wasteful. We add a soft ordinal target
+    # "just as wrong" as 100 vs 20 - wasteful. We add a soft ordinal target
     # (Gaussian around the true bin) so near-misses are penalised less. Width is
     # in BINS. ~1.0 is gentle; set 0 to fall back to plain one-hot cross-entropy.
     vel_soft_sigma:   float = 1.0
@@ -406,7 +406,7 @@ class Config:
     # "classification": binned heads + ordinal soft-target loss (default). Keeps a
     #     full output DISTRIBUTION, so sampling gives real humanization variety.
     # "regression":     continuous scalar heads + SmoothL1. Infinite resolution
-    #     (no bins at all), but predicts only the conditional MEAN → can sound
+    #     (no bins at all), but predicts only the conditional MEAN -> can sound
     #     timid on multi-modal grooves. Offered so you can A/B on real SD3 data.
     target_mode:      str = "classification"   # "classification" | "regression"
 
@@ -428,7 +428,7 @@ class Config:
     warmup_pct:       float = 0.05
     label_smoothing:  float = 0.05
     vel_loss_weight:  float = 1.0
-    off_loss_weight:  float = 2.0   # DESIGN: timing is harder → more gradient
+    off_loss_weight:  float = 2.0   # DESIGN: timing is harder -> more gradient
     val_split:        float = 0.05
     num_workers:      int = 4
     early_stop_patience: int = 15
@@ -453,7 +453,7 @@ class Config:
 # =============================================================================
 # DESIGN: fine-grained (separate open/closed HH, ride bell, china, ghost) because
 # those articulation choices ARE part of feel. NOTE: the *class* is only used as a
-# model INPUT feature — reconstruction uses each hit's ORIGINAL pitch, so real
+# model INPUT feature - reconstruction uses each hit's ORIGINAL pitch, so real
 # cymbal selection (e.g. which specific crash) is preserved exactly.
 
 GM_DRUM_MAP = {
@@ -485,8 +485,8 @@ DRUM_CLASS_NAMES = {
 }
 
 # ── Time-signature vocabulary ──────────────────────────────────────────────────
-# Maps (numerator, denominator) → categorical id. The model embeds this so it can
-# apply meter-specific accent/feel — the "one-and-two-and" of 4/4 vs the compound
+# Maps (numerator, denominator) -> categorical id. The model embeds this so it can
+# apply meter-specific accent/feel - the "one-and-two-and" of 4/4 vs the compound
 # "ONE-two-three-FOUR-five-six" lilt of 6/8. Unknown meters fall back to "other".
 TIME_SIGNATURES = [
     (4, 4), (3, 4), (2, 4), (6, 8), (12, 8), (9, 8), (5, 4), (7, 8), (6, 4), (2, 2),
@@ -516,7 +516,7 @@ class DrumEvent:
     offset_ticks: int    # signed micro-timing deviation from grid
     raw_velocity: int
     raw_tick:     int
-    raw_pitch:    int    # DESIGN: exact original GM note → faithful reconstruction
+    raw_pitch:    int    # DESIGN: exact original GM note -> faithful reconstruction
     ts_id:        int = 0    # time-signature id (see TIMESIG_TO_ID), 0 = unknown
     beat_slot:    int = 0    # metric position WITHIN this note's real measure, 0..beat_slots-1
     is_flam:      int = 0    # 1 if this is the grace/second hit of a flam/drag
@@ -529,7 +529,7 @@ class Tokenizer:
         self.cfg = cfg
 
     def velocity_to_bin(self, v: int) -> int:
-        # DESIGN: at 128 bins this is the identity (bin == velocity) → lossless.
+        # DESIGN: at 128 bins this is the identity (bin == velocity) -> lossless.
         # At coarser bin counts it groups proportionally.
         b = (int(v) * self.cfg.velocity_bins) // 128
         return min(b, self.cfg.velocity_bins - 1)
@@ -565,7 +565,7 @@ class Tokenizer:
     def _ioi_same(self, events: List[DrumEvent]) -> np.ndarray:
         """
         Per-INSTRUMENT inter-onset interval: grid steps since the SAME instrument
-        last played. DESIGN: this is what makes "consecutive same notes" legible —
+        last played. DESIGN: this is what makes "consecutive same notes" legible -
         a run of steady 16th hi-hats shows a constant same-instrument IOI even when
         kicks/snares are interleaved, so the model can cleanly recognise repetition
         (repetitive crashes, hat rhythms, tom/snare runs) and shape it. 0 = first
@@ -584,7 +584,7 @@ class Tokenizer:
     def _metric_strength(self, events: List[DrumEvent]) -> np.ndarray:
         """
         Explicit metric-strength category per note, from its position in the measure.
-        DESIGN: drummers accent strong subdivisions and ease weak ones — downbeat >
+        DESIGN: drummers accent strong subdivisions and ease weak ones - downbeat >
         beat > 8th > 16th > finer. This is a modular pattern that's hard for the model
         to discover from raw metric position, so we hand it over directly as a small
         ordinal feature (0 = strongest ... higher = weaker). We classify each position
@@ -594,7 +594,7 @@ class Tokenizer:
         n = len(events)
         strength = np.zeros(n, dtype=np.int32)
         S = self.cfg.beat_slots
-        # grid fractions from coarsest→finest, paired with their strength label
+        # grid fractions from coarsest->finest, paired with their strength label
         grids = [(1.0, 0), (0.5, 1), (0.25, 2), (0.125, 3), (0.0625, 4)]
         tol = 0.5 / S  # half a slot, in fraction units
         for i, e in enumerate(events):
@@ -604,7 +604,7 @@ class Tokenizer:
                 # does f land on this grid? (nearest multiple of `frac` within tol)
                 if abs(f - round(f / frac) * frac) < tol:
                     lab = level
-                    break                    # coarsest match wins → strongest label
+                    break                    # coarsest match wins -> strongest label
             strength[i] = lab
         return strength
 
@@ -649,7 +649,7 @@ class Tokenizer:
         return out
 
     def bin_to_velocity_f(self, b: float) -> float:
-        """Float version of bin→velocity, preserving sub-bin precision from
+        """Float version of bin->velocity, preserving sub-bin precision from
         expected-value decoding. Rounded to an int only at the very end."""
         if self.cfg.velocity_bins >= 128:
             return float(np.clip(b, 0, 127))
@@ -658,7 +658,7 @@ class Tokenizer:
     def arrays_to_events(self, arrays, source_events: List[DrumEvent]) -> List[DrumEvent]:
         result = []
         for i, src in enumerate(source_events):
-            # velocities/offsets may be FLOAT (expected-value decode) — keep the
+            # velocities/offsets may be FLOAT (expected-value decode) - keep the
             # precision through the conversion, round to int only for the MIDI note.
             vb = float(np.clip(arrays['velocities'][i], 0, self.cfg.velocity_bins - 1))
             ob = float(arrays['offsets'][i])
@@ -681,7 +681,7 @@ class Tokenizer:
         typically sit on a few coarse velocity levels; this simulates that.
 
         AVERAGE-PRESERVING: a real dry/programmed groove keeps the OVERALL loudness
-        of its genre — a dry metal part is still loud, a dry jazz part still soft.
+        of its genre - a dry metal part is still loud, a dry jazz part still soft.
         Naive independent rounding can drift the mean (rounding bias, clipping at the
         rails). So after coarsening we correct the whole groove by a single offset so
         the de-humanized MEAN matches the original mean (to the nearest velocity),
@@ -700,7 +700,7 @@ class Tokenizer:
         for_out = []
         for e, vc in zip(events, coarse):
             v_coarse = int(round(vc))
-            cb = self.velocity_to_bin(v_coarse)                      # → bins
+            cb = self.velocity_to_bin(v_coarse)                      # -> bins
             for_out.append(DrumEvent(
                 instrument=e.instrument, bar=e.bar, grid_step=e.grid_step,
                 velocity_bin=cb, offset_ticks=0,
@@ -724,7 +724,7 @@ def _build_measure_map(midi, cfg: Config):
     """
     # total length in quarter-note beats
     end_time = midi.get_end_time()
-    # tempo for sec→beat conversion
+    # tempo for sec->beat conversion
     tempo = 120.0
     try:
         tc = midi.get_tempo_changes()
@@ -735,7 +735,7 @@ def _build_measure_map(midi, cfg: Config):
     total_beats = end_time * (tempo / 60.0) + 8  # pad a little
 
     changes = sorted(getattr(midi, 'time_signature_changes', []), key=lambda t: t.time)
-    # convert change times (seconds) → beats
+    # convert change times (seconds) -> beats
     segs = []
     for ts in changes:
         segs.append((ts.time * (tempo / 60.0), ts.numerator, ts.denominator))
@@ -852,7 +852,7 @@ def events_to_midi(events: List[DrumEvent], out_path: str, cfg: Config, tempo: f
     track = pretty_midi.Instrument(program=0, is_drum=True, name="Humanized Drums")
     sec_per_tick = 60.0 / (tempo * cfg.ticks_per_beat)
     for e in events:
-        # DESIGN: use the EXACT original pitch, not a class→pitch guess. This keeps
+        # DESIGN: use the EXACT original pitch, not a class->pitch guess. This keeps
         # the specific cymbal / articulation the user programmed.
         pitch = e.raw_pitch if e.raw_pitch else INSTRUMENT_TO_GM.get(e.instrument, 38)
         grid_tick = (e.bar * cfg.grid_steps_per_bar + e.grid_step) * cfg.ticks_per_grid
@@ -869,7 +869,7 @@ def events_to_midi(events: List[DrumEvent], out_path: str, cfg: Config, tempo: f
     track.notes.sort(key=lambda n: n.start)
     midi.instruments.append(track)
     midi.write(out_path)
-    print(f"  Wrote {len(events)} notes → {out_path}")
+    print(f"  Wrote {len(events)} notes -> {out_path}")
 
 
 # =============================================================================
@@ -965,7 +965,7 @@ def _split_events_into_sections(events, cfg, section_bars=16, hop_bars=8):
     if not events:
         return []
     max_bar = max(e.bar for e in events)
-    # short files → single sample, unchanged
+    # short files -> single sample, unchanged
     if max_bar < section_bars * 1.5:
         return [events]
     sections = []
@@ -990,8 +990,8 @@ def measure_expressiveness(events, cfg: Config):
     """
     Measure how HUMANIZED a groove already is, from its target (human) performance.
     Returns a dict of stats + a boolean 'keep'. DESIGN: a sample is only rejected
-    when it is flat on BOTH velocity and timing — a genuinely robotic/quantized
-    pattern with nothing to teach. Rich dynamics OR rich micro-timing → keep it,
+    when it is flat on BOTH velocity and timing - a genuinely robotic/quantized
+    pattern with nothing to teach. Rich dynamics OR rich micro-timing -> keep it,
     because it's still a useful target for that dimension.
     """
     if not events:
@@ -1052,7 +1052,7 @@ def _process_one_file(args) -> Optional[Dict]:
             return {'_all_rejected': rejected}
         return out
     except Exception as exc:
-        # runs in a worker process — report which file broke and skip it rather than
+        # runs in a worker process - report which file broke and skip it rather than
         # letting the whole pool crash with an opaque error.
         _report_error(f"processing MIDI file '{os.path.basename(path)}' in cache builder", exc)
         return None
@@ -1066,7 +1066,7 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
     paths = sorted(set(paths))
     print(f"Found {len(paths)} MIDI files in {data_dir}")
     if split_songs:
-        print(f"Song-splitting ON: long files → {section_bars}-bar sections, hop {hop_bars}.")
+        print(f"Song-splitting ON: long files -> {section_bars}-bar sections, hop {hop_bars}.")
     if cfg.quality_filter:
         print(f"Quality filter ON: rejecting flat/robotic sections "
               f"(vel_std<{cfg.min_velocity_std} & range<{cfg.min_velocity_range} "
@@ -1109,7 +1109,7 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
     os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
     with open(cache_path, 'wb') as f:
         pickle.dump({'cfg': asdict(cfg), 'samples': samples, 'meta': meta}, f, protocol=4)
-    print(f"Cache saved → {cache_path}")
+    print(f"Cache saved -> {cache_path}")
     return samples
 
 
@@ -1133,16 +1133,16 @@ class DrumDataset(Dataset):
         """
         Drop the first K bars so the phrase starts later, then re-base positions to
         start at bar 0. K scales with groove length so longer phrases rotate more:
-            ≥16 bars → drop 8   |   ≥8 bars → drop 4   |   ≥4 bars → drop 2   |  else none
+            ≥16 bars -> drop 8   |   ≥8 bars -> drop 4   |   ≥4 bars -> drop 2   |  else none
         Applied identically to input and target. SAFE: the result is a real performance
-        starting later; only 'positions' needs shifting — metric/IOI/velocity/offset are
+        starting later; only 'positions' needs shifting - metric/IOI/velocity/offset are
         invariant to whole-bar rotation. Returns (inp, tgt) unchanged if too short.
         """
         spb = self.cfg.grid_steps_per_bar
         n = len(inp['positions'])
         if n == 0:
             return inp, tgt
-        max_bar = int(inp['positions'].max()) // spb      # zero-based → total bars = max_bar+1
+        max_bar = int(inp['positions'].max()) // spb      # zero-based -> total bars = max_bar+1
         total_bars = max_bar + 1
         # pick the largest rotation the length qualifies for
         if total_bars >= 16:
@@ -1210,7 +1210,7 @@ class DrumDataset(Dataset):
         # DESIGN: the model also sees per-note velocities, so it could ignore the
         # global intensity scalar and read loudness locally. To force intensity to be
         # a REAL lever, we sometimes shift the WHOLE groove's loudness by a random
-        # amount — applying the SAME shift to input AND target — and let intensity be
+        # amount - applying the SAME shift to input AND target - and let intensity be
         # computed from the shifted input. Now intensity genuinely predicts the output
         # level, so the model must learn to obey it. Preserves per-note dynamics
         # (it's a global shift, not a squash).
@@ -1232,9 +1232,9 @@ class DrumDataset(Dataset):
         # Intensity = mean INPUT velocity over the real (unpadded) notes, in [0,1].
         # DESIGN: computed on the de-humanized input (whose mean is preserved), so it
         # matches the loudness the humanized target should keep. This is the global
-        # "how hard is this being played / what genre" signal — and the exact knob the
+        # "how hard is this being played / what genre" signal - and the exact knob the
         # user can set at inference to request an intensity.
-        real_vel = inp['velocities'].astype(float) * vscale        # bins → MIDI vel
+        real_vel = inp['velocities'].astype(float) * vscale        # bins -> MIDI vel
         intensity = float(np.clip(real_vel.mean() / 127.0, 0.0, 1.0)) if len(real_vel) else 0.5
 
         inp = self._pad(inp, L)
@@ -1259,10 +1259,10 @@ class DrumDataset(Dataset):
             'tempo_norm':  torch.tensor(inp['tempo_norm'], dtype=torch.float32),
             'is_flam':     torch.tensor(np.clip(inp['is_flam'], 0, 1), dtype=torch.long),
             'flam_gap':    torch.tensor(np.clip(inp['flam_gap'], 0, self.cfg.flam_gap_bins - 1), dtype=torch.long),
-            # targets — classification (bins)
+            # targets - classification (bins)
             'tgt_velocities': torch.tensor(tgt['velocities'], dtype=torch.long),
             'tgt_offsets':    torch.tensor(tgt['offsets'], dtype=torch.long),
-            # targets — regression (continuous)
+            # targets - regression (continuous)
             'tgt_vel_cont':   torch.tensor(tgt['vel_cont'], dtype=torch.float32),
             'tgt_off_cont':   torch.tensor(tgt['off_cont'], dtype=torch.float32),
             'pad_mask':       pad_mask,
@@ -1315,11 +1315,11 @@ class DrumEventEmbedding(nn.Module):
     Embed one hit from (instrument, musical position, bar, IOI, input-velocity)
     plus a GLOBAL intensity signal (the groove's overall average velocity).
     DESIGN: musical position (where in the bar) AND IOI (steps since last hit) are
-    BOTH fed in — the first grounds phrase/beat awareness, the second gives local
+    BOTH fed in - the first grounds phrase/beat awareness, the second gives local
     rhythmic density, which drives feel (e.g. tight vs laid-back sixteenths).
     The intensity scalar tells the model the OVERALL loudness/genre context (e.g.
     ~0.9 = loud metal, ~0.4 = soft jazz), so it doesn't have to guess the level
-    from local notes alone — and so it can be *set* explicitly at inference.
+    from local notes alone - and so it can be *set* explicitly at inference.
     """
     def __init__(self, cfg: Config):
         super().__init__()
@@ -1338,9 +1338,9 @@ class DrumEventEmbedding(nn.Module):
         self.flam_emb       = nn.Embedding(2, d)
         self.flam_gap_emb   = nn.Embedding(cfg.flam_gap_bins, d)
         self.proj           = nn.Linear(d * 11, d)
-        # intensity: scalar in [0,1] → d-dim conditioning vector, added to every token
+        # intensity: scalar in [0,1] -> d-dim conditioning vector, added to every token
         self.intensity_proj = nn.Sequential(nn.Linear(1, d), nn.GELU(), nn.Linear(d, d))
-        # tempo: per-note scalar in [0,1] → d-dim, added as a residual (feel scales w/ tempo)
+        # tempo: per-note scalar in [0,1] -> d-dim, added as a residual (feel scales w/ tempo)
         self.tempo_proj     = nn.Sequential(nn.Linear(1, d), nn.GELU(), nn.Linear(d, d))
         self.norm           = nn.LayerNorm(d)
 
@@ -1373,7 +1373,7 @@ class DrumEventEmbedding(nn.Module):
         fge = self.flam_gap_emb(flam_gap.clamp(max=self.flam_gap_emb.num_embeddings - 1))
         x = self.proj(torch.cat([ie, ve, oe, pe, be, tse, bse, ose, mse, fle, fge], dim=-1))
         if intensity is not None:
-            # intensity: (B,) or (B,1) → (B,1,d) broadcast across time
+            # intensity: (B,) or (B,1) -> (B,1,d) broadcast across time
             inten = intensity.view(-1, 1).float()
             cond = self.intensity_proj(inten).unsqueeze(1)      # (B,1,d)
             x = x + cond
@@ -1389,7 +1389,7 @@ class RelativePositionBias(nn.Module):
     #4 T5-style relative-position attention bias. Instead of adding absolute position
     to the input, we add a learned scalar bias to each attention score based on the
     (bucketed) signed distance between query and key positions. The model keys off
-    HOW FAR APART two hits are, not their absolute index — which generalises to phrase
+    HOW FAR APART two hits are, not their absolute index - which generalises to phrase
     lengths and start-positions it never saw. Buckets grow logarithmically so nearby
     distances get fine resolution and far ones share buckets.
     """
@@ -1400,7 +1400,7 @@ class RelativePositionBias(nn.Module):
         self.rel_bias = nn.Embedding(2 * num_buckets + 1, num_heads)
 
     def _bucket(self, rel_pos):
-        # map signed relative position → bucket id in [0, 2*num_buckets]
+        # map signed relative position -> bucket id in [0, 2*num_buckets]
         nb = self.num_buckets
         ret = torch.zeros_like(rel_pos)
         n = -rel_pos                                   # so sign is handled symmetrically
@@ -1464,7 +1464,7 @@ class RelPosEncoderLayer(nn.Module):
 class HumanizationTransformer(nn.Module):
     """
     Encoder-only. Bidirectional attention over the WHOLE pattern (wide context),
-    then per-position heads predict every hit's humanization IN PARALLEL — one
+    then per-position heads predict every hit's humanization IN PARALLEL - one
     forward pass, no autoregression.
 
     Heads depend on cfg.target_mode:
@@ -1474,7 +1474,7 @@ class HumanizationTransformer(nn.Module):
           and offset in [-1,1] (tanh). Infinite resolution, single-valued.
 
     The model predicts only velocity and timing. It never predicts or changes
-    pitch — every hit keeps the exact note you played.
+    pitch - every hit keeps the exact note you played.
     """
     def __init__(self, cfg: Config):
         super().__init__()
@@ -1499,7 +1499,7 @@ class HumanizationTransformer(nn.Module):
             self.layers = None
 
         if cfg.target_mode == "regression":
-            # DESIGN: raw linear velocity head (NOT sigmoid+MSE — that combo has
+            # DESIGN: raw linear velocity head (NOT sigmoid+MSE - that combo has
             # vanishing gradients near the rails); we clamp to [0,1] at decode.
             self.velocity_head = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 1))
             self.offset_head   = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 1), nn.Tanh())
@@ -1535,7 +1535,7 @@ class HumanizationTransformer(nn.Module):
                        tempo_norm=batch.get('tempo_norm'), is_flam=batch.get('is_flam'),
                        flam_gap=batch.get('flam_gap'))
         if self.cfg.rel_pos_encoding:
-            # relative encoding carries position via attention bias — no absolute add
+            # relative encoding carries position via attention bias - no absolute add
             rb = self.rel_bias(T, x.device)
             for layer in self.layers:
                 x = layer(x, rel_bias=rb, key_padding_mask=batch['pad_mask'])
@@ -1731,7 +1731,7 @@ def evaluate(model, loader, device, cfg):
             vbins = torch.arange(cfg.velocity_bins, device=device).float()
             vhat_v = (F.softmax(out['vel'], -1) * vbins).sum(-1) * vel_scale
             vtru_v = batch['tgt_velocities'].float() * vel_scale
-            ohat_t = out['off'].argmax(-1).float() - mot                 # ticks (bin→signed)
+            ohat_t = out['off'].argmax(-1).float() - mot                 # ticks (bin->signed)
             otru_t = batch['tgt_offsets'].float() - mot
 
         tot['vel_mae'] += (vhat_v[valid] - vtru_v[valid]).abs().mean().item()
@@ -1759,19 +1759,19 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
     # means: keep this fraction of the underlying samples, and augmentation still
     # varies THOSE normally. Random subset (not a prefix) so it isn't biased toward
     # whatever order the cache happened to store files in. Useful for a cheap,
-    # fast SCREENING pass — e.g. during grid search — before a full-data confirm run.
+    # fast SCREENING pass - e.g. during grid search - before a full-data confirm run.
     n_full = len(samples)
     data_fraction = float(np.clip(data_fraction, 0.0, 1.0))
     if data_fraction < 1.0:
         n_keep = max(cfg.batch_size * 2, int(round(n_full * data_fraction)))
         n_keep = min(n_keep, n_full)
-        rng = random.Random(GLOBAL_SEED)   # fixed seed → reproducible subset across runs
+        rng = random.Random(GLOBAL_SEED)   # fixed seed -> reproducible subset across runs
         samples = rng.sample(samples, n_keep)
         print(f"[data_fraction={data_fraction:.2f}] Using {n_keep}/{n_full} training "
-              f"samples (random subset) — FASTER but less data than a full run.")
+              f"samples (random subset) - FASTER but less data than a full run.")
 
     # ── Dataset provenance summary ────────────────────────────────────────────────
-    # original MIDI files → section-samples after song-splitting/quality-filter →
+    # original MIDI files -> section-samples after song-splitting/quality-filter ->
     # effective items per epoch including on-the-fly augmentation.
     n_split = len(samples)
     print("\n── Dataset ──────────────────────────────────────────")
@@ -1788,7 +1788,7 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         if meta.get('sections_rejected', 0):
             print(f"  Quality-filtered out:     {meta['sections_rejected']} flat/robotic sections")
     else:
-        print(f"  Section-samples:          {n_full} (no cache metadata — "
+        print(f"  Section-samples:          {n_full} (no cache metadata - "
               f"synthetic or pre-metadata cache)")
     if data_fraction < 1.0:
         print(f"  Capped by --data_fraction: {n_split}/{n_full} samples used for this run")
@@ -1800,7 +1800,7 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         print(f"  + augmentation (per epoch): ~{aug_per_epoch} of {n_split} samples "
               f"bar-rotated (p={cfg.bar_rotation_prob:.2f}); different picks each epoch")
         print(f"  Effective items/epoch:    {n_split} "
-              f"(each may appear rotated or not — augmentation adds variety, not count)")
+              f"(each may appear rotated or not - augmentation adds variety, not count)")
     else:
         print(f"  Total training items:     {n_split} (augmentation off)")
     print("─────────────────────────────────────────────────────\n")
@@ -1866,14 +1866,14 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
             # Report epoch/batch and the exact line, with actionable guidance for OOM.
             if 'out of memory' in str(exc).lower():
                 _report_error(f"training ran out of GPU memory at epoch {epoch+1} "
-                              f"batch {step+1}/{num_batches} — reduce --batch_size or "
+                              f"batch {step+1}/{num_batches} - reduce --batch_size or "
                               f"use a smaller --model_size", exc, fatal=True)
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
             else:
                 _report_error(f"training step failed at epoch {epoch+1} "
                               f"batch {step+1}/{num_batches}", exc, fatal=True)
-            raise   # a broken training step is fatal — don't silently continue
+            raise   # a broken training step is fatal - don't silently continue
         print()   # newline after the in-place batch counter finishes for this epoch
 
         nb = num_batches
@@ -1899,11 +1899,11 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
                 if bad >= cfg.early_stop_patience:
                     print(f"Early stopping at epoch {epoch}."); break
         except Exception as exc:
-            # Checkpoint I/O failure (disk full, permissions). Report clearly — the
+            # Checkpoint I/O failure (disk full, permissions). Report clearly - the
             # epoch's training is done, so warn and keep going rather than lose the run.
             _report_error(f"saving checkpoint for epoch {epoch+1} to '{ckpt_dir}' "
                           f"(disk full or permissions?)", exc, fatal=True)
-    print(f"\nDone. Best val loss: {best_val:.4f}  →  {ckpt_dir}/best.pt")
+    print(f"\nDone. Best val loss: {best_val:.4f}  ->  {ckpt_dir}/best.pt")
     return {'best_val': best_val, 'ckpt_dir': ckpt_dir,
             'best_ckpt': os.path.join(ckpt_dir, 'best.pt')}
 
@@ -1919,19 +1919,19 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
     own held-out validation split via the SAME train()/evaluate() path used normally,
     and prints every result sorted BEST FIRST (lowest validation loss).
 
-    DESIGN: this is intentionally the small, explicit grid you asked for — 3 batch
-    sizes × 2 lrs × all model sizes — not the full 60-argument space. Every other
+    DESIGN: this is intentionally the small, explicit grid you asked for - 3 batch
+    sizes × 2 lrs × all model sizes - not the full 60-argument space. Every other
     setting is held fixed at base_cfg (whatever defaults/overrides you already
     applied, e.g. bar_rotation ON, rel_pos ON, etc.), so this sweep isolates exactly
     those three axes. Each run gets its own checkpoint dir so nothing overwrites.
 
     data_fraction: SCREENING speed-up. A full grid trains N models on the FULL
-    dataset, which is wasteful — you mostly need each combo's RELATIVE ranking, not
+    dataset, which is wasteful - you mostly need each combo's RELATIVE ranking, not
     its final quality. Default (None) auto-picks a reasonable fraction based on how
-    many combos there are (more combos → smaller fraction per run), floored at 15%
+    many combos there are (more combos -> smaller fraction per run), floored at 15%
     and capped at 100%. Pass 1.0 to disable and use the full dataset for every run.
     After the sweep, retrain the winning combo alone at data_fraction=1.0 for the
-    real, final model — the sweep is for RANKING, not for producing the deliverable.
+    real, final model - the sweep is for RANKING, not for producing the deliverable.
     """
     batch_sizes = batch_sizes or [16, 32, 64]
     lrs = lrs or [1e-4, 3e-4]
@@ -1941,7 +1941,7 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
     total = len(combos)
 
     if data_fraction is None:
-        # more combos → cheaper each run needs to be to keep total sweep time sane.
+        # more combos -> cheaper each run needs to be to keep total sweep time sane.
         # Heuristic: 100% for ≤4 combos, tapering down to a 15% floor by ~24 combos.
         data_fraction = float(np.clip(1.0 - 0.85 * (total - 4) / 20.0, 0.15, 1.0))
 
@@ -1949,9 +1949,9 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
     print(f"  batch_sizes = {batch_sizes}")
     print(f"  lrs         = {lrs}")
     print(f"  model_sizes = {model_sizes}")
-    print(f"  → {len(batch_sizes)} × {len(lrs)} × {len(model_sizes)} = {total} runs")
+    print(f"  -> {len(batch_sizes)} × {len(lrs)} × {len(model_sizes)} = {total} runs")
     print(f"  data_fraction per run = {data_fraction:.2f}  "
-          f"({'full dataset' if data_fraction >= 1.0 else 'SCREENING subset — retrain the winner at 1.0 for the final model'})")
+          f"({'full dataset' if data_fraction >= 1.0 else 'SCREENING subset - retrain the winner at 1.0 for the final model'})")
     print(f"====================================================\n")
 
     results = []
@@ -1979,7 +1979,7 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
             })
         except Exception as exc:
             # One failing config (e.g. OOM on a large model_size/batch_size combo)
-            # must not abort the rest of the sweep — report it and continue.
+            # must not abort the rest of the sweep - report it and continue.
             _report_error(f"grid-search run {i+1}/{total} ('{run_name}') failed", exc)
             results.append({
                 'run_name': run_name, 'model_size': ms, 'batch_size': bs, 'lr': lr,
@@ -1993,26 +1993,26 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
     results.sort(key=lambda r: r['best_val'])
     print(f"\n\n=================== GRID SEARCH RESULTS (best first) ===================")
     if data_fraction < 1.0:
-        print(f"  (each run used a {data_fraction:.0%} random subset of the data — "
+        print(f"  (each run used a {data_fraction:.0%} random subset of the data - "
               f"for RANKING/screening, not final quality)")
     print(f"{'rank':>4}  {'val_loss':>10}  {'model_size':>10}  {'batch':>6}  {'lr':>9}  "
           f"{'run_name':<28}  status")
     print("-" * 100)
     for rank, r in enumerate(results, 1):
-        vloss = f"{r['best_val']:.4f}" if r['status'] == 'ok' else "   —"
+        vloss = f"{r['best_val']:.4f}" if r['status'] == 'ok' else "   -"
         print(f"{rank:>4}  {vloss:>10}  {r['model_size']:>10}  {r['batch_size']:>6}  "
               f"{r['lr']:>9.2e}  {r['run_name']:<28}  {r['status']}")
     ok = [r for r in results if r['status'] == 'ok']
     if ok:
         best = ok[0]
         print(f"\nBest: {best['run_name']}  (val_loss={best['best_val']:.4f})  "
-              f"→ {best['best_ckpt']}")
+              f"-> {best['best_ckpt']}")
         if data_fraction < 1.0:
-            print(f"  → This ranking used only {data_fraction:.0%} of the data. Retrain "
+            print(f"  -> This ranking used only {data_fraction:.0%} of the data. Retrain "
                   f"model_size={best['model_size']} batch_size={best['batch_size']} "
                   f"lr={best['lr']:.2e} with --data_fraction 1.0 for the real final model.")
     else:
-        print("\nAll runs failed — see [ERROR] messages above.")
+        print("\nAll runs failed - see [ERROR] messages above.")
     print("=" * 100)
     return results
 
@@ -2071,7 +2071,7 @@ def apply_fast_hit_velocity_cap(events, velocities, cfg,
                                 ceiling=85.0, full_ceiling_hz=18.0, no_cap_hz=6.0,
                                 compress=True):
     """
-    OPTION B — physical-plausibility filter (a RULE, not learned behaviour).
+    OPTION B - physical-plausibility filter (a RULE, not learned behaviour).
 
     Real drummers can't hit hard when hitting fast: a blast beat (32nds on snare)
     tops out around ~85 velocity because the physical stroke can't be both fast and
@@ -2079,16 +2079,16 @@ def apply_fast_hit_velocity_cap(events, velocities, cfg,
     SAME-INSTRUMENT hits, using per-instrument timing (tempo-aware).
 
     How the ceiling scales with speed (hits/second for that instrument):
-      • ≤ no_cap_hz         → no ceiling (slow enough to hit full power)
-      • ≥ full_ceiling_hz   → full ceiling applied (blast-beat fast)
-      • between             → ceiling ramps in linearly
+      • ≤ no_cap_hz         -> no ceiling (slow enough to hit full power)
+      • ≥ full_ceiling_hz   -> full ceiling applied (blast-beat fast)
+      • between             -> ceiling ramps in linearly
     So 8ths are untouched, 16ths lightly capped, 32nds fully capped.
 
     compress=True softly compresses velocities toward the ceiling (keeps some
     dynamic variation below the wall) instead of hard-clipping everyone to it,
     which would sound mechanical.
 
-    Returns (new_velocities, n_affected). Purely a plausibility guard — off by
+    Returns (new_velocities, n_affected). Purely a plausibility guard - off by
     default; the model may already have learned this from data (try without first).
     """
     v = velocities.astype(float).copy()
@@ -2112,7 +2112,7 @@ def apply_fast_hit_velocity_cap(events, velocities, cfg,
         steps = gpos_i - prev_gpos
         if steps <= 0:
             continue
-        # convert grid steps → seconds using tempo. one beat = grid_resolution steps.
+        # convert grid steps -> seconds using tempo. one beat = grid_resolution steps.
         tempo = getattr(e, 'tempo_bpm', 120.0) or 120.0
         sec_per_step = (60.0 / tempo) / cfg.grid_resolution
         interval_s = steps * sec_per_step
@@ -2149,7 +2149,7 @@ def humanize_file(checkpoint, input_path, output_path,
     model, cfg = load_model(checkpoint, device)
     tok = Tokenizer(cfg)
     # inference-time overrides of AR-timing (a post-process, so it doesn't need to
-    # match training — the user chooses it at humanize time)
+    # match training - the user chooses it at humanize time)
     if ar_timing is not None:
         cfg.ar_timing = bool(ar_timing)
     if ar_timing_weight is not None:
@@ -2181,13 +2181,13 @@ def humanize_file(checkpoint, input_path, output_path,
     # ── Intensity conditioning ────────────────────────────────────────────────────
     # The whole-file average input velocity (in [0,1]) is the intensity/genre signal
     # the model was trained on. By default we derive it from your input file, so a
-    # loud input → loud humanization, a soft input → soft. You can OVERRIDE it to
+    # loud input -> loud humanization, a soft input -> soft. You can OVERRIDE it to
     # request a specific intensity: e.g. feed a soft groove but ask for metal energy.
     file_intensity = float(np.clip((original['velocities'].astype(float) * vscale).mean() / 127.0, 0.0, 1.0))
     if intensity is None:
         use_intensity = file_intensity
         print(f"Intensity (from input): {use_intensity:.2f}  "
-              f"(~{use_intensity*127:.0f} avg velocity — the playing intensity/genre cue)")
+              f"(~{use_intensity*127:.0f} avg velocity - the playing intensity/genre cue)")
     else:
         use_intensity = float(np.clip(intensity, 0.0, 1.0))
         print(f"Intensity (OVERRIDE): {use_intensity:.2f} (~{use_intensity*127:.0f} avg vel); "
@@ -2251,15 +2251,15 @@ def humanize_file(checkpoint, input_path, output_path,
                 np.round(hum['off']).astype(np.int32) + mot, 0, cfg.offset_bins - 1).astype(np.int32)
 
     # original in the same real units, as the anchor for the strength blend/extrapolation
-    orig_vel_real = original['velocities'].astype(float) * vscale   # bins→vel (or vel at 128)
-    orig_off_real = original['offsets'].astype(float) - mot         # bins→ticks (YOUR baked-in offsets)
+    orig_vel_real = original['velocities'].astype(float) * vscale   # bins->vel (or vel at 128)
+    orig_off_real = original['offsets'].astype(float) - mot         # bins->ticks (YOUR baked-in offsets)
 
     # ── Strength = how far to move FROM the dry input TOWARD (and past) the model ──
     # result = original + strength * (model - original)
-    #   0.0 → dry input untouched
-    #   1.0 → exactly what the model inferred
-    #   >1.0 → EXTRAPOLATE: push further in the same direction the model moved each
-    #          hit ("model made it late → make it later; louder → louder").
+    #   0.0 -> dry input untouched
+    #   1.0 -> exactly what the model inferred
+    #   >1.0 -> EXTRAPOLATE: push further in the same direction the model moved each
+    #          hit ("model made it late -> make it later; louder -> louder").
     # We keep separate velocity and timing strengths because timing saturates at the
     # ±offset ceiling much faster than velocity does. If strength_timing is None it
     # follows strength.
@@ -2271,15 +2271,15 @@ def humanize_file(checkpoint, input_path, output_path,
     # from the grid was probably placed there deliberately (already humanized), while
     # a note sitting exactly ON the grid is "raw" and safe to humanize fully. So we
     # scale the effective TIMING strength per note by its existing grid distance:
-    #   on-grid  (|offset|≈0)      → full strength (let the model work)
-    #   far off  (|offset|≈ceiling) → strength floored toward `preserve_floor`
+    #   on-grid  (|offset|≈0)      -> full strength (let the model work)
+    #   far off  (|offset|≈ceiling) -> strength floored toward `preserve_floor`
     # preserve_grid_distance in [0,1] sets how strongly this applies (0 = off, the old
     # behaviour). preserve_floor is the minimum strength a maximally-off-grid note keeps.
     per_note_s_off = np.full(N, s_off, dtype=float)
     if preserve_grid_distance > 0.0:
         dist = np.abs(orig_off_real) / max(1.0, mot)          # 0 (on grid) … 1 (at ceiling)
         dist = np.clip(dist, 0.0, 1.0)
-        # scale factor: 1 at grid, → preserve_floor as dist→1, mixed by preserve_grid_distance
+        # scale factor: 1 at grid, -> preserve_floor as dist->1, mixed by preserve_grid_distance
         scale = 1.0 - preserve_grid_distance * (1.0 - preserve_floor) * dist
         per_note_s_off = s_off * scale
         n_preserved = int(np.sum(dist > 0.15))
@@ -2290,7 +2290,7 @@ def humanize_file(checkpoint, input_path, output_path,
     # ── Preserve already-expressive DYNAMICS (velocity analog of the above) ────────
     # DESIGN: the velocity analog of "already off-grid" is "already dynamically
     # varied". If the velocities around a note already swing a lot, you've probably
-    # dialed expressive dynamics there by hand — so scale the model's VELOCITY
+    # dialed expressive dynamics there by hand - so scale the model's VELOCITY
     # influence down in those spots, and let it work fully where the input is flat
     # (a run of identical velocities that clearly wasn't humanized). We measure each
     # note's deviation from a local rolling mean of the input velocity.
@@ -2321,7 +2321,7 @@ def humanize_file(checkpoint, input_path, output_path,
     hum['off'] = orig_off_real + per_note_s_off * (hum['off'] - orig_off_real)
 
     # ── #3 Autoregressive-over-beats timing: give micro-timing MOMENTUM ───────────
-    # Real drummers drift and recover — a push on one beat carries into the next
+    # Real drummers drift and recover - a push on one beat carries into the next
     # rather than resetting. We add a causal exponential carry: each note inherits a
     # fraction of the running timing "drift" from earlier notes (in time order). This
     # turns independent per-note offsets into a correlated push/pull, off by default.
@@ -2353,7 +2353,7 @@ def humanize_file(checkpoint, input_path, output_path,
     off_clipped = int(np.sum(np.abs(hum['off']) > mot))
 
     # write results back onto the events (real units). Pitch is ALWAYS the original
-    # note the user played — the model only changes velocity and micro-timing.
+    # note the user played - the model only changes velocity and micro-timing.
     hum_events = []
     for i, src in enumerate(events):
         hum_events.append(DrumEvent(
@@ -2372,10 +2372,10 @@ def humanize_file(checkpoint, input_path, output_path,
     oo = orig_off_real
     ho = np.array([e.offset_ticks for e in hum_events], dtype=float)
     print("\n── Humanization Summary ─────────────────────────────")
-    print(f"  Velocity  mean {ov.mean():.1f} → {hv.mean():.1f}   "
-          f"std {ov.std():.1f} → {hv.std():.1f}  (MIDI velocity units)")
-    print(f"  Timing    mean {oo.mean():.1f} → {ho.mean():.1f}   "
-          f"std {oo.std():.1f} → {ho.std():.1f} ticks")
+    print(f"  Velocity  mean {ov.mean():.1f} -> {hv.mean():.1f}   "
+          f"std {ov.std():.1f} -> {hv.std():.1f}  (MIDI velocity units)")
+    print(f"  Timing    mean {oo.mean():.1f} -> {ho.mean():.1f}   "
+          f"std {oo.std():.1f} -> {ho.std():.1f} ticks")
     if vel_clipped or off_clipped:
         print(f"  Saturation (from high strength): "
               f"{vel_clipped} velocities hit [1,127], "
@@ -2404,8 +2404,8 @@ def main():
     p.add_argument('--lr', type=float, default=None)
     p.add_argument('--model_size', default=None,
                    choices=list(MODEL_PRESETS.keys()),
-                   help='progressively deeper presets: tiny→small→base(default)→'
-                        'deep→deeper→huge. Deeper models may capture more musical '
+                   help='progressively deeper presets: tiny->small->base(default)->'
+                        'deep->deeper->huge. Deeper models may capture more musical '
                         'intuition but need more data/compute and can overfit. '
                         'Set at TRAIN time; inference reads it from the checkpoint.')
     p.add_argument('--grid_batch_sizes', type=str, default=None,
@@ -2419,7 +2419,7 @@ def main():
                         "(default: all of tiny,small,base,deep,deeper,huge).")
     p.add_argument('--data_fraction', type=float, default=None,
                    help='TRAIN / GRID_SEARCH: cap training-data usage to this fraction '
-                        '(0.0–1.0) of the whole (+augmented) training set — a random '
+                        '(0.0–1.0) of the whole (+augmented) training set - a random '
                         'subset, taken before augmentation (augmentation still varies '
                         'the kept subset normally). Speeds up experiments/screening. '
                         'TRAIN mode: default 1.0 (use everything). GRID_SEARCH: default '
@@ -2444,7 +2444,7 @@ def main():
     p.add_argument('--intensity', type=float, default=None,
                    help='INFERENCE: overall playing intensity / genre cue, either 0..1 '
                         '(normalized) or a raw MIDI velocity 1..127. Default: derived '
-                        'from the input file average (loud in→loud out, soft in→soft). '
+                        'from the input file average (loud in->loud out, soft in->soft). '
                         'Override to request a target energy: e.g. 0.9 (~114) for metal '
                         'intensity, 0.4 (~50) for soft jazz, regardless of input level.')
     p.add_argument('--context_overlap', type=float, default=0.33,
@@ -2455,7 +2455,7 @@ def main():
     p.add_argument('--fast_hit_cap', action='store_true',
                    help='INFERENCE: apply a physical-plausibility velocity ceiling to '
                         'fast same-instrument runs (e.g. blast-beat 32nd snares cap ~85). '
-                        'A RULE, not learned — off by default; try WITHOUT first to see '
+                        'A RULE, not learned - off by default; try WITHOUT first to see '
                         'if the model already learned the ceiling from data, then A/B.')
     p.add_argument('--fast_hit_ceiling', type=float, default=85.0,
                    help='INFERENCE: the velocity ceiling for maximally-fast hits when '
@@ -2476,14 +2476,14 @@ def main():
                         'so output is a distribution, not just the timid mean. Off by default.')
     p.add_argument('--correlation_loss', action='store_true',
                    help='TRAIN: add a loss rewarding the metric-strength↔velocity '
-                        'relationship — on-beat stronger, off-beat mellower (#7). Off by default.')
+                        'relationship - on-beat stronger, off-beat mellower (#7). Off by default.')
     p.add_argument('--ar_timing', action='store_true',
                    help='INFERENCE: give micro-timing momentum across beats (#3) so '
                         'pushes drift and recover like a real player. Off by default.')
     p.add_argument('--ar_timing_weight', type=float, default=None,
                    help='INFERENCE: strength of the AR-timing carry (default 0.3).')
     p.add_argument('--refine_passes', type=int, default=1,
-                   help='INFERENCE: iterative refinement (#11) — re-run the model on its '
+                   help='INFERENCE: iterative refinement (#11) - re-run the model on its '
                         'own output N times so later passes see humanized context. '
                         'Default 1 (single pass); try 2–3.')
     p.add_argument('--no_split_songs', action='store_true',
@@ -2507,7 +2507,7 @@ def main():
                    help='CACHE: reject-if-flat timing range threshold (ticks, default 6).')
     p.add_argument('--bar_rotation', dest='bar_rotation', action='store_true',
                    default=None,
-                   help='TRAIN: enable bar-rotation augmentation — drop the first bars so '
+                   help='TRAIN: enable bar-rotation augmentation - drop the first bars so '
                         'phrases start at varied points (drops 2/4/8 bars for grooves '
                         '≥4/≥8/≥16 bars), so the model does not over-index on phrase '
                         'openings. Safe (result is still a real performance). ON by default.')
@@ -2732,7 +2732,7 @@ if __name__ == '__main__':
         print("\n[interrupted] Stopped by user (Ctrl-C).")
         sys.exit(130)
     except SystemExit:
-        raise   # argparse errors / explicit sys.exit — already reported
+        raise   # argparse errors / explicit sys.exit - already reported
     except Exception as exc:
         # Last-resort catch-all: pinpoint the exact file:line and give the type/message,
         # plus the full traceback, so an otherwise-cryptic crash is debuggable.

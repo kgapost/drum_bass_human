@@ -7,12 +7,12 @@
 WHAT THIS PROGRAM DOES
 -----------------------
 Given a QUERY drum MIDI file, ranks every file in your training MIDI library by
-how similar it "feels" rhythmically and dynamically — the same idea as Superior
+how similar it "feels" rhythmically and dynamically - the same idea as Superior
 Drummer 3's "Tap2Find" (drag-a-MIDI-in mode): drop in a groove you like, get
 back a ranked list of the closest matches from your library.
 
 NOTE ON RELATION TO TAP2FIND: Toontrack does not publish Tap2Find's internal
-algorithm, so this is NOT a reproduction of it — it's an independent, from-
+algorithm, so this is NOT a reproduction of it - it's an independent, from-
 scratch similarity method built on standard, explainable signal-processing
 ideas (rhythmic-pattern histograms + dynamics profile + tempo/density), with
 every step visible and tunable. Treat it as an equivalent TOOL for the same
@@ -21,34 +21,34 @@ JOB, not a clone of SD3's proprietary matching.
 HOW SIMILARITY IS COMPUTED
 ----------------------------
 Each MIDI file is reduced to a compact "fingerprint" with four core parts:
-  1) RHYTHM   — for each drum voice (kick/snare/hats/toms/...), a histogram of
+  1) RHYTHM   - for each drum voice (kick/snare/hats/toms/...), a histogram of
                 WHERE in the bar it tends to land (fraction of that voice's
                 hits falling on each 16th-note grid position, folded onto ONE
-                representative bar via modulo — see DESIGN note below).
-  2) VELOCITY — for each drum voice, its average loudness (0-1), capturing the
+                representative bar via modulo - see DESIGN note below).
+  2) VELOCITY - for each drum voice, its average loudness (0-1), capturing the
                 dynamic/energy profile (a soft brushed groove vs. a hard-hit one).
-  3) DENSITY  — overall notes-per-bar, a simple complexity signal.
-  4) TEMPO    — the file's BPM.
+  3) DENSITY  - overall notes-per-bar, a simple complexity signal.
+  4) TEMPO    - the file's BPM.
 Two files' similarity is a WEIGHTED BLEND of cosine similarity on (1) and (2)
-and closeness on (3) and (4) — weights are CLI-tunable so you can decide how
+and closeness on (3) and (4) - weights are CLI-tunable so you can decide how
 much tempo or raw density should matter versus the rhythmic pattern itself.
 
 OPTIONAL ARTICULATION-FLATTENED COMPONENTS (off by default, weight 0.0)
 -------------------------------------------------------------------------
 The core RHYTHM component above compares each of the 13 drum-voice classes
 SEPARATELY, so it naturally penalizes an articulation swap even when the
-underlying pattern is identical — e.g. the same 8th-note pattern played on
+underlying pattern is identical - e.g. the same 8th-note pattern played on
 closed vs. open hi-hat looks "different" to it, because those are different
 rows in the histogram. Three optional components restore pattern-only
 matching for exactly the cases where articulation is usually the least
 important part of the idea:
   --weight_hihat_pattern   hi-hat, ALL articulations (closed/open/pedal)
                            flattened into ONE row before comparing.
-  --weight_tom_pattern     toms, flattened to TWO functional groups — floor
-                           tom vs. rack toms — instead of three raw pitches.
+  --weight_tom_pattern     toms, flattened to TWO functional groups - floor
+                           tom vs. rack toms - instead of three raw pitches.
   --weight_cymbal_pattern  cymbals (crash/ride/ride-bell/china/splash), ALL
                            flattened into ONE row before comparing.
-Each defaults to 0.0 (not considered at all — identical to the original
+Each defaults to 0.0 (not considered at all - identical to the original
 behavior). Give one a positive weight to have "does the hi-hat pattern feel
 the same, regardless of articulation" (etc.) factored into the blend.
 
@@ -56,28 +56,28 @@ OPTIONAL PER-INSTRUMENT VELOCITY FLOORS (index-time, off by default)
 ------------------------------------------------------------------------
 --min_velocity_kick / _snare / _hihat / _toms / _cymbals (0-127, default 0)
 exclude notes in that instrument group below the given velocity from the
-fingerprint ENTIRELY — they never enter the rhythm histogram, the velocity
+fingerprint ENTIRELY - they never enter the rhythm histogram, the velocity
 profile, or any of the flattened-pattern components. A ghost-note snare hit
 and a full backbeat hit are rhythmically different in KIND, not just
 loudness, so filtering lets you compare the "real" pattern without quiet
 fill/ghost notes diluting it. These are baked into the index at build time
-(same as --min_notes) — change them and rebuild with --mode index to apply.
+(same as --min_notes) - change them and rebuild with --mode index to apply.
 
-DESIGN NOTE — why "fold onto one representative bar" instead of comparing
+DESIGN NOTE - why "fold onto one representative bar" instead of comparing
 whole files directly
 ---------------------------------------------------------------------------
 A 2-bar loop repeated 8 times and a 4-bar phrase played once should be able to
-match each other if they have the same FEEL — file length and tempo shouldn't
+match each other if they have the same FEEL - file length and tempo shouldn't
 matter to "does this feel similar." Folding every note's position modulo the
 bar length (averaged across however many bars the file has) makes the
 fingerprint invariant to file length and repeat count, and comparing histograms
 instead of raw event sequences makes it tempo-invariant too (a loop played at
 100 BPM and the "same feel" loop at 140 BPM still produce the same histogram).
 This does trade away sensitivity to LONGER-scale structure (a build across 8
-bars) — it captures "typical feel," not "exact performance," which is the right
+bars) - it captures "typical feel," not "exact performance," which is the right
 tradeoff for "find me things that feel like this."
 
-HOW IT IS USED — TWO MODES
+HOW IT IS USED - TWO MODES
 ------------------------------
   1) index : scan a MIDI library, extract a fingerprint for every file, cache it.
   2) query : given a query MIDI (in or outside the library), rank the cached
@@ -115,7 +115,7 @@ try:
     HAS_PRETTY_MIDI = True
 except ImportError:
     HAS_PRETTY_MIDI = False
-    print("Warning: pretty_midi not installed — MIDI I/O disabled. "
+    print("Warning: pretty_midi not installed - MIDI I/O disabled. "
           "Install with: pip install pretty_midi")
 
 
@@ -138,7 +138,7 @@ def _error_location(exc: BaseException) -> str:
 def _report_error(context: str, exc: BaseException, fatal: bool = False):
     loc = _error_location(exc)
     print(f"\n[ERROR] {context}")
-    print(f"        → {type(exc).__name__} at {loc}: {exc}")
+    print(f"        -> {type(exc).__name__} at {loc}: {exc}")
     if fatal:
         print("        Full traceback:")
         traceback.print_exc()
@@ -160,10 +160,10 @@ class Config:
     weight_velocity: float = 0.2
     weight_density:  float = 0.15
     weight_tempo:    float = 0.15
-    # OPTIONAL extra components — articulation-flattened per-instrument-GROUP
+    # OPTIONAL extra components - articulation-flattened per-instrument-GROUP
     # patterns. Default 0.0 = not considered at all (matches existing behavior
     # exactly). Set a positive weight to factor a group's pattern into the blend
-    # REGARDLESS of which specific articulation was used within that group — see
+    # REGARDLESS of which specific articulation was used within that group - see
     # the module DESIGN note on why this differs from the main rhythm component.
     weight_hihat_pattern:  float = 0.0    # closed+open+pedal hi-hat, flattened to 1
     weight_tom_pattern:    float = 0.0    # all toms, flattened to {floor, rack} = 2
@@ -173,9 +173,9 @@ class Config:
     tempo_scale:     float = 25.0   # BPM difference that "feels different"
 
     # ── Per-instrument-group velocity floors (INDEX-time; baked into the finger-
-    # print, so changing these requires rebuilding the index — same as min_notes).
+    # print, so changing these requires rebuilding the index - same as min_notes).
     # DESIGN: a ghost-note snare hit and a full backbeat hit are rhythmically
-    # different in KIND, not just loudness — lumping them together can dilute what
+    # different in KIND, not just loudness - lumping them together can dilute what
     # "the pattern" actually is. Each floor is 0-127; a note in that group with
     # velocity BELOW its floor is dropped entirely before it's counted into the
     # rhythm histogram, velocity profile, or any of the flattened-pattern
@@ -192,7 +192,7 @@ class Config:
 
 
 # =============================================================================
-# MINIMAL GM DRUM MAP  (self-contained — no dependency on other project files)
+# MINIMAL GM DRUM MAP  (self-contained - no dependency on other project files)
 # =============================================================================
 GM_DRUM_MAP = {
     35: 0, 36: 0,
@@ -217,13 +217,13 @@ DRUM_CLASS_NAMES = {
 
 # ── Articulation-flattening groups for the optional pattern components ──────────
 # DESIGN: "does the hi-hat pattern feel the same" should be TRUE even if one
-# groove plays it all-closed and another opens the hat for an accent — that's
+# groove plays it all-closed and another opens the hat for an accent - that's
 # the same rhythmic idea on the same physical instrument, just a different
 # articulation choice. The main RHYTHM component (per the module docstring)
 # already compares each of the 13 classes separately, so it naturally penalizes
 # an articulation swap even when the underlying pattern is identical. These
 # three optional components restore that invariance for exactly the cases
-# where "which articulation" is usually the LEAST important part of the idea —
+# where "which articulation" is usually the LEAST important part of the idea -
 # hi-hats, toms (functionally: floor vs rack), and cymbal choice.
 HIHAT_CLASSES   = (2, 3)          # HH-Closed, HH-Open (pedal is already folded into 2)
 FLOOR_TOM_CLASS = (4,)            # both floor-tom pitches already share class 4
@@ -232,7 +232,7 @@ CYMBAL_CLASSES  = (7, 8, 9, 10)   # Crash, Ride, RideBell, China/Splash
 
 # ── Per-instrument-group velocity-floor lookup ──────────────────────────────────
 # Maps each drum class -> which Config field holds its minimum velocity (or None
-# if that class has no dedicated floor — perc/other pass through unfiltered since
+# if that class has no dedicated floor - perc/other pass through unfiltered since
 # only these five groups were asked for).
 _VELOCITY_FLOOR_FIELD = {
     0: 'min_velocity_kick',
@@ -286,7 +286,7 @@ def _extract_fingerprint_impl(path: str, cfg: Config) -> Optional[Dict]:
         # not a naive `time * tempo`. A file with a mid-file tempo change would
         # otherwise place every note after the change at the WRONG grid position
         # (verified: a note exactly 1 beat after a 120->240bpm change landed at
-        # tick 480 under the naive formula vs. its true tick 720 — a full 2-step
+        # tick 480 under the naive formula vs. its true tick 720 - a full 2-step
         # grid error). time_to_tick() returns ticks in the FILE's own resolution,
         # so we rescale to our fixed internal ticks_per_beat via a beats-elapsed
         # intermediate (resolution-independent).
@@ -313,7 +313,7 @@ def _extract_fingerprint_impl(path: str, cfg: Config) -> Optional[Dict]:
                             where=row_sums > 0)
 
     # OPTIONAL flattened-articulation pattern components. Sum RAW counts across
-    # each group's classes first, THEN normalize the combined row to sum to 1 —
+    # each group's classes first, THEN normalize the combined row to sum to 1 -
     # summing already-normalized rows would double-count unevenly depending on
     # how many hits each articulation individually had.
     def _flatten(counts_2d, class_ids):
@@ -329,7 +329,7 @@ def _extract_fingerprint_impl(path: str, cfg: Config) -> Optional[Dict]:
     ]).astype(np.float32)                                                          # (2, spb)
 
     # VELOCITY block: mean velocity per instrument, normalized to [0,1]. Silent
-    # (unused) instruments get 0 — again a natural, meaningful penalty.
+    # (unused) instruments get 0 - again a natural, meaningful penalty.
     vel_mean = np.divide(vel_sum, vel_n, out=np.zeros_like(vel_sum), where=vel_n > 0) / 127.0
 
     density = used_notes / max(1, n_bars)   # notes per bar
@@ -338,7 +338,7 @@ def _extract_fingerprint_impl(path: str, cfg: Config) -> Optional[Dict]:
         'rhythm': rhythm_norm.astype(np.float32),      # (NUM_INSTRUMENTS, spb)
         'velocity': vel_mean.astype(np.float32),        # (NUM_INSTRUMENTS,)
         'hihat_pattern': hihat_pattern,                  # (spb,)
-        'tom_pattern': tom_pattern,                      # (2, spb) — [floor, rack]
+        'tom_pattern': tom_pattern,                      # (2, spb) - [floor, rack]
         'cymbal_pattern': cymbal_pattern,                # (spb,)
         'density': float(density),
         'tempo': float(tempo),
@@ -418,7 +418,7 @@ def build_index(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
                       f"{time.time()-t0:.0f}s", end='', flush=True)
     print()
     if not fingerprints:
-        print("ERROR: no usable MIDI files found — nothing to index.")
+        print("ERROR: no usable MIDI files found - nothing to index.")
         sys.exit(1)
 
     # stack into arrays for fast vectorized similarity search at query time
@@ -453,7 +453,7 @@ def build_index(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
                     'hihat_pattern': hihat_mat, 'tom_pattern': tom_mat,
                     'cymbal_pattern': cymbal_mat,
                     'density': density_vec, 'tempo': tempo_vec}, f, protocol=4)
-    print(f"Indexed {N} files ({failed} skipped: parse errors or too sparse) → {cache_path}")
+    print(f"Indexed {N} files ({failed} skipped: parse errors or too sparse) -> {cache_path}")
     return idx_paths
 
 
@@ -505,7 +505,7 @@ def compute_similarities(query_fp: Dict, index: Dict, cfg: Config) -> np.ndarray
     weights = [cfg.weight_rhythm, cfg.weight_velocity, cfg.weight_density, cfg.weight_tempo]
     sims = [sim_rhythm, sim_velocity, sim_density, sim_tempo]
 
-    # 5-7) OPTIONAL articulation-flattened components — only touched if weighted > 0
+    # 5-7) OPTIONAL articulation-flattened components - only touched if weighted > 0
     for name, w, key in [('hi-hat', cfg.weight_hihat_pattern, 'hihat_pattern'),
                          ('tom', cfg.weight_tom_pattern, 'tom_pattern'),
                          ('cymbal', cfg.weight_cymbal_pattern, 'cymbal_pattern')]:
@@ -564,14 +564,14 @@ def query_similar(query_path: str, cache_path: str, top_k: int = 10,
     print(f"\nQuery: {query_path}")
     print(f"  {query_fp['n_notes']} notes, {query_fp['n_bars']} bars, "
           f"tempo≈{query_fp['tempo']:.0f} bpm, density≈{query_fp['density']:.1f} notes/bar")
-    print(f"  weights → rhythm={cfg.weight_rhythm:.2f} velocity={cfg.weight_velocity:.2f} "
+    print(f"  weights -> rhythm={cfg.weight_rhythm:.2f} velocity={cfg.weight_velocity:.2f} "
           f"density={cfg.weight_density:.2f} tempo={cfg.weight_tempo:.2f}")
     extra = []
     if cfg.weight_hihat_pattern > 0:  extra.append(f"hihat_pattern={cfg.weight_hihat_pattern:.2f}")
     if cfg.weight_tom_pattern > 0:    extra.append(f"tom_pattern={cfg.weight_tom_pattern:.2f}")
     if cfg.weight_cymbal_pattern > 0: extra.append(f"cymbal_pattern={cfg.weight_cymbal_pattern:.2f}")
     if extra:
-        print(f"  + optional  → {' '.join(extra)}")
+        print(f"  + optional  -> {' '.join(extra)}")
     print(f"\n── Top {len(results)} most similar grooves ─────────────────────────")
     for rank, r in enumerate(results, 1):
         insts = ",".join(DRUM_CLASS_NAMES[i] for i in r['instruments_used'][:4])
@@ -598,7 +598,7 @@ def main():
                    help='INDEX: skip files with fewer drum notes than this (default 4).')
     p.add_argument('--min_velocity_kick', type=int, default=None,
                    help='INDEX: ignore kick notes below this velocity (0-127, default 0 '
-                        '= no filtering). Baked into the index — rebuild to change.')
+                        '= no filtering). Baked into the index - rebuild to change.')
     p.add_argument('--min_velocity_snare', type=int, default=None,
                    help='INDEX: ignore snare notes below this velocity (0-127, default 0). '
                         'Useful for excluding ghost notes from the pattern comparison.')
@@ -628,16 +628,16 @@ def main():
                    help='QUERY: contribution of tempo closeness (default 0.15). Set to 0 '
                         'to match purely on feel regardless of tempo.')
     p.add_argument('--weight_hihat_pattern', type=float, default=None,
-                   help='QUERY: OPTIONAL — consider the hi-hat pattern with all '
+                   help='QUERY: OPTIONAL - consider the hi-hat pattern with all '
                         'articulations (closed/open/pedal) flattened into one, so a '
                         'matching rhythm counts even if the articulation differs. '
                         'Default 0.0 = not considered at all.')
     p.add_argument('--weight_tom_pattern', type=float, default=None,
-                   help='QUERY: OPTIONAL — consider the tom pattern, flattened to two '
+                   help='QUERY: OPTIONAL - consider the tom pattern, flattened to two '
                         'functional groups (floor tom, rack toms) rather than each tom '
                         'pitch separately. Default 0.0 = not considered at all.')
     p.add_argument('--weight_cymbal_pattern', type=float, default=None,
-                   help='QUERY: OPTIONAL — consider the cymbal pattern with crash/ride/'
+                   help='QUERY: OPTIONAL - consider the cymbal pattern with crash/ride/'
                         'ride-bell/china/splash all flattened into one, so a matching '
                         'accent rhythm counts even if the cymbal choice differs. '
                         'Default 0.0 = not considered at all.')
@@ -670,7 +670,7 @@ def main():
         if args.output_json:
             with open(args.output_json, 'w') as f:
                 json.dump(results, f, indent=2)
-            print(f"Results written → {args.output_json}")
+            print(f"Results written -> {args.output_json}")
 
 
 if __name__ == '__main__':

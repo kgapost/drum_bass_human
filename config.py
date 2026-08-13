@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
- CONFIG — every named constant used by drum_bass_studio.py
+ CONFIG - every named constant used by drum_bass_studio.py
 ==============================================================================
 This file holds NOTHING but constants: no functions, no classes, no imports
 beyond what a value literally needs (none, here). It exists so every number
-that reflects a DESIGN DECISION or a JUDGMENT CALL — as opposed to a pure UI
-cosmetic choice like a window's pixel geometry — lives in exactly one place,
+that reflects a DESIGN DECISION or a JUDGMENT CALL - as opposed to a pure UI
+cosmetic choice like a window's pixel geometry - lives in exactly one place,
 named, uppercase, with a comment explaining the reasoning behind the specific
 value chosen. This includes the INITIAL VALUES of every slider/checkbox the
-GUI exposes, not just the thresholds used inside the phase-processing logic —
+GUI exposes, not just the thresholds used inside the phase-processing logic -
 so a programmer reviewing this file sees the complete set of decisions the
 tool currently makes on the user's behalf, in one screen, without having to
 hunt through widget-construction code to find out what a fresh segment starts
@@ -35,7 +35,7 @@ whatever they were derived from.
 PHASE2_MAX_RUSH_DRAG_BEATS = 1.0 / 32
 
 # Beats 2 and 4 ("the main beats" minus 1 and 3) get LESS rush/drag effect than
-# the e/a syncopation points — JUDGMENT CALL, set to 25% LOWER than full
+# the e/a syncopation points - JUDGMENT CALL, set to 25% LOWER than full
 # strength (i.e. multiplied by 0.75) per the design discussion: e/a positions
 # are where a rushing/dragging FEEL is most audible, while 2 and 4 are meant to
 # move along with that feel more subtly rather than as strongly. Retune this if
@@ -45,7 +45,7 @@ PHASE2_WEAK_BEAT_DAMPING = 0.75
 # Vestigial: an earlier design considered varying WHICH positions get selected
 # based on how many e/a hits a segment actually has (skip 2/4 if e/a alone are
 # dense enough). The final decision was "always select e/a/2/4, unconditionally"
-# — so this constant is currently UNUSED by classify_phase2_role(). Kept as a
+# - so this constant is currently UNUSED by classify_phase2_role(). Kept as a
 # named placeholder in case a future revision wants density-conditional
 # selection back; safe to delete if that's not wanted.
 PHASE2_DENSITY_UNUSED_THRESHOLD = 2
@@ -59,13 +59,13 @@ PHASE2_DENSITY_UNUSED_THRESHOLD = 2
 # grid cell starting at 17 ticks (cfg.ticks_per_grid=30, so 17 > half the cell).
 # PHASE2_SAFE_OFFSET_FRACTION is set to land the clip AT the slider's own
 # nominal max (15 ticks = PHASE2_MAX_RUSH_DRAG_BEATS * ticks_per_beat), one
-# tick inside the verified-safe boundary — so a full-strength (|slider|=1.0)
+# tick inside the verified-safe boundary - so a full-strength (|slider|=1.0)
 # rush/drag on a note with NO pre-existing offset reaches its full nominal
 # effect uncapped, while a note that ALREADY carries a large offset (from
 # Phase 1, or a previous Phase 2 pass) still gets safely capped before its
 # combined total could cross into reassignment territory. This is a HARD
 # TECHNICAL CONSTRAINT (verified empirically), not a taste-based judgment call
-# — do not raise it above ~0.53 (16 ticks) without re-verifying the boundary.
+# - do not raise it above ~0.53 (16 ticks) without re-verifying the boundary.
 PHASE2_SAFE_OFFSET_FRACTION = 0.5   # of cfg.ticks_per_grid = 15 ticks (verified safe to 16)
 
 # ── Phase 2 slider default positions (JUDGMENT CALL: both start at "no change") ──
@@ -76,7 +76,7 @@ PHASE2_DEFAULT_QUANTIZE = 0.0    # a fresh segment's quantize sliders start unto
 # from_/to bounds) ────────────────────────────────────────────────────────────
 # Rush/drag is signed (drag before the grid .. rush after it); quantize is a
 # one-directional strength dial (0=untouched .. 1=fully snapped), so its range
-# does NOT go negative — there's no meaningful "negative quantize."
+# does NOT go negative - there's no meaningful "negative quantize."
 PHASE2_RUSH_DRAG_RANGE = (-1.0, 1.0)
 PHASE2_QUANTIZE_RANGE = (0.0, 1.0)
 
@@ -87,7 +87,7 @@ PHASE2_QUANTIZE_RANGE = (0.0, 1.0)
 
 # "1/256 note" == 1/64 of a beat (same note-duration convention as Phase 2).
 # JUDGMENT CALL: this is deliberately TIGHTER than Phase 2's rush/drag range
-# (1/64 beat vs 1/32) — a bass note should only be considered "aimed at" a
+# (1/64 beat vs 1/32) - a bass note should only be considered "aimed at" a
 # kick/snare hit if it's genuinely close, not loosely nearby; a wider threshold
 # risks snapping a bass note that was actually intended as a passing tone
 # between two drum hits (see the earlier discussion on kick-vs-passing-note
@@ -95,7 +95,7 @@ PHASE2_QUANTIZE_RANGE = (0.0, 1.0)
 PHASE3_SNAP_THRESHOLD_BEATS = 1.0 / 64
 
 # Audibility-delay range endpoints (milliseconds). At slider=0 -> 0ms (off,
-# exactly, as a special case — see run_phase3_sync). As the slider rises toward
+# exactly, as a special case - see run_phase3_sync). As the slider rises toward
 # 1, the random draw range widens from [LOW_MIN, LOW_MAX] up to
 # [HIGH_MIN, HIGH_MAX], interpolated linearly (_interpolated_delay_range_ms).
 # JUDGMENT CALL: 1-2ms is roughly the smallest delay a listener can register at
@@ -112,7 +112,7 @@ PHASE3_DELAY_HIGH_MAX_MS = 10.0
 PHASE3_DEFAULT_SNAP_STRENGTH = 0.0   # a fresh segment's bass starts unsnapped
 PHASE3_DEFAULT_DELAY_AMOUNT = 0.0    # a fresh segment's bass starts with no added delay
 
-# ── Phase 3 slider travel ranges (both are one-directional strength dials —
+# ── Phase 3 slider travel ranges (both are one-directional strength dials -
 # there's no meaningful "negative snap" or "negative delay") ───────────────────
 PHASE3_SNAP_STRENGTH_RANGE = (0.0, 1.0)
 PHASE3_DELAY_AMOUNT_RANGE = (0.0, 1.0)
@@ -138,14 +138,14 @@ PHASE1_DEFAULT_INTENSITY = None          # None = auto-derive from the input fil
                                           # value below (which only matters once "Auto" is
                                           # unchecked)
 # JUDGMENT CALL: whether the "Auto intensity" checkbox starts CHECKED for a
-# fresh segment. True by default — auto-deriving intensity from the input is
+# fresh segment. True by default - auto-deriving intensity from the input is
 # the safer, more predictable starting point; a user who wants to override it
 # to a specific target energy (see drum_humanizer_v3's own --intensity docs)
 # unchecks this deliberately.
 PHASE1_DEFAULT_INTENSITY_AUTO = True
 # JUDGMENT CALL: the intensity SLIDER's own initial numeric position (only
 # actually used once "Auto intensity" is unchecked). 0.5 = the exact midpoint
-# of its 0..1 range — a neutral starting point that doesn't bias the user
+# of its 0..1 range - a neutral starting point that doesn't bias the user
 # toward "loud" or "soft" before they've listened to anything.
 PHASE1_DEFAULT_INTENSITY_VALUE = 0.5
 PHASE1_INTENSITY_RANGE = (0.0, 1.0)
@@ -201,7 +201,7 @@ SEGMENTATION_CONTEXT_OVERLAP = 0.25
 # The 5-group taxonomy (kick / snare / toms / everything-else) used throughout
 # Phase 2's per-instrument sliders, matching find_similar_grooves.py's grouping
 # with cymbals+hihat+perc collapsed into one "other" bucket (per the design
-# discussion — only kick/snare/toms were judged to need independent control).
+# discussion - only kick/snare/toms were judged to need independent control).
 # Values are drum_humanizer_v3's DRUM_CLASS_NAMES ids: 0=kick, 1=snare,
 # 2/3=hihat closed/open, 4/5/6=low/mid/high tom, 7-10=crash/ride/bell/china,
 # 11/12=perc/other.
@@ -216,7 +216,7 @@ GROUP_OTHER = (2, 3, 7, 8, 9, 10, 11, 12)   # hihat + cymbals + perc + other
 # =============================================================================
 
 # JUDGMENT CALL: below this width, a segment rectangle would be too thin to
-# reliably click on a long song with many short segments — floor it at 2px
+# reliably click on a long song with many short segments - floor it at 2px
 # regardless of how small its true duration-proportional share would be. This
 # means very short segments in a long song read as slightly WIDER than their
 # exact proportional share (a deliberate, minor accuracy-for-usability trade).

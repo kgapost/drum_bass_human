@@ -7,13 +7,13 @@
 WHAT THIS PROGRAM DOES
 -----------------------
 Given a long drum MIDI file (e.g. a full song assembled from several distinct
-grooves/sections), predict WHERE the theme/section boundaries are — i.e. which
+grooves/sections), predict WHERE the theme/section boundaries are - i.e. which
 measures start a genuinely new pattern versus continue/repeat the current one.
 
 There is no hand-labeled boundary data. Instead, this tool SYNTHESIZES its own
 ground truth: it takes short single-theme MIDI files (loops) from your library,
 concatenates many of them together in long, randomized sequences with random
-repeats, and — because *it* did the concatenating — knows exactly where every
+repeats, and - because *it* did the concatenating - knows exactly where every
 true boundary is. That is the (input, label) training pair. A model then
 learns to detect the same kind of boundary in a real, unlabeled file.
 
@@ -21,12 +21,12 @@ KEY RULES (as specified)
 -------------------------
   • Eligible "theme" files: filename does NOT contain "song" (case-insensitive)
     AND the file is at most 10 measures long AND its very first note lands
-    exactly on beat 1 of bar 1 (a clean downbeat start — see DESIGN note below).
-  • Repeating the SAME theme back-to-back is NOT a boundary — only a genuine
+    exactly on beat 1 of bar 1 (a clean downbeat start - see DESIGN note below).
+  • Repeating the SAME theme back-to-back is NOT a boundary - only a genuine
     change of theme is labeled as one.
   • Filenames that look like variations of each other (e.g. "Blues Fast Fill 1"
     vs "Blues Fast Fill 14") are treated as the same "family" and never used as
-    two different themes in one training sample — only one member of a family
+    two different themes in one training sample - only one member of a family
     is picked per sample, so near-duplicate takes never masquerade as a real,
     learnable boundary.
   • Each training sample concatenates 30–40 distinct themes (configurable), each
@@ -36,17 +36,17 @@ KEY RULES (as specified)
     be judged to START on a note that sits at the very start of a measure
     (grid_step == 0). infer_segments() enforces this explicitly.
 
-DESIGN NOTE — why "clean downbeat start" is required for a theme to be eligible
+DESIGN NOTE - why "clean downbeat start" is required for a theme to be eligible
 ---------------------------------------------------------------------------------
 Because only grid-step-0 notes are ever allowed to carry a boundary label, a
 theme whose first note is NOT on the downbeat (a pickup/anacrusis) would have
-no note to attach its true boundary to — an unlabelable positive example. Such
+no note to attach its true boundary to - an unlabelable positive example. Such
 files are excluded from theme selection so every boundary the model is trained
 on has a real note carrying its label. This is a real, stated limitation: a
 song built with off-downbeat pickup sections in your own inference data may be
 harder for the model to catch, precisely because it was never shown one.
 
-HOW IT IS USED — THREE MODES
+HOW IT IS USED - THREE MODES
 ------------------------------
   1) dataset : scan a MIDI library, filter eligible themes, synthesize the
                concatenated+repeated training sequences, cache them.
@@ -96,7 +96,7 @@ try:
     HAS_PRETTY_MIDI = True
 except ImportError:
     HAS_PRETTY_MIDI = False
-    print("Warning: pretty_midi not installed — MIDI I/O disabled. "
+    print("Warning: pretty_midi not installed - MIDI I/O disabled. "
           "Install with: pip install pretty_midi")
 
 try:
@@ -107,7 +107,7 @@ except ImportError:
 
 
 # =============================================================================
-# REPRODUCIBILITY — single seed for ALL random number generators
+# REPRODUCIBILITY - single seed for ALL random number generators
 # =============================================================================
 GLOBAL_SEED = 42
 
@@ -149,7 +149,7 @@ def _error_location(exc: BaseException) -> str:
 def _report_error(context: str, exc: BaseException, fatal: bool = False):
     loc = _error_location(exc)
     print(f"\n[ERROR] {context}")
-    print(f"        → {type(exc).__name__} at {loc}: {exc}")
+    print(f"        -> {type(exc).__name__} at {loc}: {exc}")
     if fatal:
         print("        Full traceback:")
         traceback.print_exc()
@@ -163,7 +163,7 @@ def _report_error(context: str, exc: BaseException, fatal: bool = False):
 class Config:
     # ── Musical grid (simplifying assumption: fixed 4/4, unlike the humanizer) ──
     ticks_per_beat:     int = 480
-    grid_resolution:    int = 4       # subdivisions per beat → 16th-note grid
+    grid_resolution:    int = 4       # subdivisions per beat -> 16th-note grid
     beats_per_bar:      int = 4
     max_bars:           int = 4096    # long concatenated sequences need headroom
 
@@ -172,11 +172,11 @@ class Config:
     max_theme_measures:  int   = 10       # themes longer than this are excluded
     min_notes_per_theme: int   = 4        # too-sparse files are excluded
     # DESIGN: the PRIMARY, reliable de-duplication is exact-match after stripping a
-    # trailing take-number ("Blues Fast Fill 1"/"...14" both -> "blues fast fill" —
+    # trailing take-number ("Blues Fast Fill 1"/"...14" both -> "blues fast fill" -
     # handles the user's stated example with zero ambiguity). This ratio is only a
     # SECONDARY, coarser safety net for near-duplicate spellings the strip misses
     # ("funk verse"/"funk verses"). Generic string similarity has no threshold that
-    # is right for every naming convention — e.g. "Groove00"/"Groove01" (genuinely
+    # is right for every naming convention - e.g. "Groove00"/"Groove01" (genuinely
     # different themes) can score as similarly "close" as true near-duplicates. Kept
     # conservative (high) by default so it rarely merges themes that are actually
     # different; lower it via --family_similarity if your library has closer misses.
@@ -220,7 +220,7 @@ class Config:
 
 
 # =============================================================================
-# MINIMAL GM DRUM MAP  (self-contained — no dependency on other project files)
+# MINIMAL GM DRUM MAP  (self-contained - no dependency on other project files)
 # =============================================================================
 GM_DRUM_MAP = {
     35: 0, 36: 0,                          # kick
@@ -274,7 +274,7 @@ def _load_midi_notes_impl(path: str, cfg: Config) -> Optional[List[NoteEvent]]:
         if inst < 0:
             continue
         # DESIGN: tempo-change-AWARE conversion via pretty_midi's own time_to_tick()
-        # — see the matching fix (and its verification) in find_similar_grooves.py's
+        # - see the matching fix (and its verification) in find_similar_grooves.py's
         # _extract_fingerprint_impl for why a naive `time * single_tempo` formula
         # silently misplaces every note after a mid-file tempo change.
         beats_elapsed = midi.time_to_tick(n.start) / midi.resolution
@@ -289,7 +289,7 @@ def _load_midi_notes_impl(path: str, cfg: Config) -> Optional[List[NoteEvent]]:
 
 def load_midi_notes(path: str, cfg: Config) -> Optional[List[NoteEvent]]:
     """Load a MIDI file's drum notes onto the fixed grid. Returns None (and
-    reports why) on any parse failure — callers treat None as 'skip this file'."""
+    reports why) on any parse failure - callers treat None as 'skip this file'."""
     if not HAS_PRETTY_MIDI:
         raise ImportError("pretty_midi required for MIDI I/O")
     try:
@@ -312,7 +312,7 @@ def measure_count(events: List[NoteEvent]) -> int:
 # almost always different TAKES of the same underlying theme, not two genuinely
 # different themes. If we concatenated both into one training sample as if they
 # were distinct, the "boundary" between them would be musically near-undetectable
-# (label noise) — and worse, it would teach the model that near-identical audio
+# (label noise) - and worse, it would teach the model that near-identical audio
 # can still be a boundary, which is exactly wrong. So: normalize each filename
 # to a "family" key by stripping numbers/extensions/separators, and NEVER pick
 # two files from the same (or a very similar) family as separate themes in one
@@ -340,8 +340,8 @@ def scan_theme_files(data_dir: str, cfg: Config) -> Tuple[Dict[str, List[Tuple[s
       • it parses successfully and has ≥ cfg.min_notes_per_theme notes
       • its length is ≤ cfg.max_theme_measures measures
       • its very first note lands exactly on bar 0 / grid_step 0 (a clean
-        downbeat start — see the module DESIGN note for why this is required)
-    Returns (families, stats) where families maps a normalized name → list of
+        downbeat start - see the module DESIGN note for why this is required)
+    Returns (families, stats) where families maps a normalized name -> list of
     (path, events) tuples, and stats reports how many files were excluded and why.
     """
     paths = []
@@ -428,7 +428,7 @@ def events_to_arrays(events: List[NoteEvent], cfg: Config) -> Dict[str, np.ndarr
 # order, assign each a random repeat count, and concatenate them back-to-back
 # with bar indices re-based so everything stays grid-aligned. Because WE did the
 # concatenating, we know exactly which note is the true first note of each new
-# theme's FIRST occurrence in its block — that note (and only that note) gets
+# theme's FIRST occurrence in its block - that note (and only that note) gets
 # boundary=1. Repeats of the same theme within its own block get boundary=0.
 
 def _pick_family_keys(families: Dict, k: int, rng: random.Random, similarity: float) -> List[str]:
@@ -518,7 +518,7 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_samples: int):
     with open(cache_path, 'wb') as f:
         pickle.dump({'cfg': asdict(cfg), 'samples': samples,
                     'scan_stats': stats, 'num_families': len(families)}, f, protocol=4)
-    print(f"Cache saved → {cache_path}")
+    print(f"Cache saved -> {cache_path}")
     return samples
 
 
@@ -529,7 +529,7 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_samples: int):
 class SegDataset(Dataset):
     """
     Windows each long synthetic sample down to cfg.max_seq_len notes per training
-    step (a random crop each call — different context each epoch). Labels are
+    step (a random crop each call - different context each epoch). Labels are
     per-note and window-crop-invariant (a note's boundary status doesn't depend on
     where the window starts), so cropping never corrupts the target.
     """
@@ -599,7 +599,7 @@ def make_loaders(samples: List[Dict], cfg: Config):
 # =============================================================================
 # MODEL
 # =============================================================================
-# DESIGN: kept deliberately SIMPLER than the humanizer's feature set, per request —
+# DESIGN: kept deliberately SIMPLER than the humanizer's feature set, per request -
 # no per-instrument IOI, no flam detection (irrelevant to segmentation). Inputs are
 # just: instrument, velocity, position-in-measure, a simple global IOI, an explicit
 # "is this a measure-start note" flag, and absolute sequence position.
@@ -675,7 +675,7 @@ class SegmentationTransformer(nn.Module):
 # =============================================================================
 # DESIGN: supervise ONLY measure-start notes (grid_step==0). Non-measure-start
 # notes can NEVER be a true boundary by construction, so including them in the
-# loss would just be trivial always-0 supervision — wasted signal that also makes
+# loss would just be trivial always-0 supervision - wasted signal that also makes
 # the already-severe class imbalance worse. The model still SEES every note (full
 # context matters for deciding whether the next downbeat is a boundary); we only
 # score it at the positions the task actually cares about.
@@ -784,7 +784,7 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
           except RuntimeError as exc:
             if 'out of memory' in str(exc).lower():
                 _report_error(f"training ran out of memory at epoch {epoch+1} "
-                              f"batch {step+1}/{num_batches} — reduce --batch_size", exc, fatal=True)
+                              f"batch {step+1}/{num_batches} - reduce --batch_size", exc, fatal=True)
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
             else:
@@ -814,7 +814,7 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         except Exception as exc:
             _report_error(f"saving checkpoint for epoch {epoch+1} to '{ckpt_dir}'", exc, fatal=True)
 
-    print(f"\nDone. Best val F1: {best_f1:.4f}  →  {ckpt_dir}/best.pt")
+    print(f"\nDone. Best val F1: {best_f1:.4f}  ->  {ckpt_dir}/best.pt")
     return {'best_f1': best_f1, 'ckpt_dir': ckpt_dir, 'best_ckpt': os.path.join(ckpt_dir, 'best.pt')}
 
 
@@ -844,7 +844,7 @@ def infer_segments(events: List[NoteEvent], probs: np.ndarray, cfg: Config,
     """
     STANDALONE thresholding function, as requested: given per-note boundary
     probabilities (aligned 1:1 with `events`), decide which measures are predicted
-    theme starts. A segment can ONLY start on a note at grid_step==0 — this is
+    theme starts. A segment can ONLY start on a note at grid_step==0 - this is
     enforced explicitly here, not left to the model. Notes NOT at grid_step==0 are
     never candidates, no matter their probability.
 
@@ -884,7 +884,7 @@ def _chunk_batch(arr, cfg, device):
 
 def bar_to_seconds(bar: int, midi, cfg: Config) -> float:
     """
-    Convert a bar index to its start time in seconds, tempo-change-AWARE — uses
+    Convert a bar index to its start time in seconds, tempo-change-AWARE - uses
     the file's own pretty_midi.tick_to_time(), not a naive constant sec_per_bar.
     A file with a mid-file tempo change would otherwise report (and slice/segment)
     every boundary after the change at the WRONG time, compounding the same class
@@ -903,7 +903,7 @@ def compute_segment_boundaries(model, cfg: Config, input_path: str, threshold: f
     model loaded in memory (e.g. a UI that shouldn't reload a checkpoint from disk
     on every request) can reuse it directly. Returns a dict with: 'starts' (bar
     indices where a new theme begins), 'tempo' (bpm, a single representative value
-    — for PRECISE bar->seconds conversion in a file with tempo changes, use
+    - for PRECISE bar->seconds conversion in a file with tempo changes, use
     bar_to_seconds(bar, result['midi'], cfg) instead of tempo*beats_per_bar math),
     'total_measures', 'events' (the loaded NoteEvent list), 'probs' (per-note
     boundary probabilities, aligned 1:1 with 'events'), 'midi' (the loaded
@@ -980,7 +980,7 @@ def segment_file(checkpoint: str, input_path: str, threshold: float = 0.5,
     print(f"\n── Predicted theme boundaries (threshold={threshold}) ─────────────")
     for bar, sec in zip(starts, starts_sec):
         print(f"  measure {bar + 1:4d}   (~{sec:7.2f}s)")
-    print(f"  → {len(starts)} segments detected across {result['total_measures']} measures")
+    print(f"  -> {len(starts)} segments detected across {result['total_measures']} measures")
     print(f"──────────────────────────────────────────────────────────────────\n")
 
     if output_json:
@@ -990,7 +990,7 @@ def segment_file(checkpoint: str, input_path: str, threshold: float = 0.5,
                   'segment_start_seconds': [round(s, 3) for s in starts_sec]}
         with open(output_json, 'w') as f:
             json.dump(report, f, indent=2)
-        print(f"Report written → {output_json}")
+        print(f"Report written -> {output_json}")
 
     if output_midi:
         try:
@@ -1001,7 +1001,7 @@ def segment_file(checkpoint: str, input_path: str, threshold: float = 0.5,
             pm.lyrics = [pretty_midi.Lyric(f"Theme_{i+1}", sec)
                         for i, sec in enumerate(starts_sec)]
             pm.write(output_midi)
-            print(f"MIDI with theme markers (as lyric/text events) written → {output_midi}")
+            print(f"MIDI with theme markers (as lyric/text events) written -> {output_midi}")
         except Exception as exc:
             _report_error(f"writing marker MIDI to '{output_midi}'", exc)
 
@@ -1038,7 +1038,7 @@ def main():
     p.add_argument('--family_similarity', type=float, default=None,
                    help='DATASET: filename-similarity ratio (0-1) above which two themes '
                         'are treated as the same family and never both used in one sample '
-                        '(default 0.95 — see DESIGN note in the source for the tradeoff).')
+                        '(default 0.95 - see DESIGN note in the source for the tradeoff).')
 
     # train mode
     p.add_argument('--epochs', type=int, default=None)

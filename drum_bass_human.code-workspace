@@ -4,5 +4,8 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"python.defaultInterpreterPath": "${workspaceFolder}/dbh/bin/python",
+		"python.terminal.activateEnvironment": true
+	}
 }
