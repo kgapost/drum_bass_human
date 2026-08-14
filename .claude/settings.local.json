@@ -11,7 +11,22 @@
       "Bash(git add *)",
       "Bash(git branch *)",
       "Bash(git commit *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(ls -la \"/media/kapost/Schemsis/Midi - Copy\" 2>&1)",
+      "Read(//media/kapost/Schemsis/Midi - Copy/**)",
+      "WebSearch",
+      "Bash(find \"/media/kapost/Schemsis/Midi - Copy/ViR2\" -type f | head -n 50; echo \"---count---\"; find \"/media/kapost/Schemsis/Midi - Copy/ViR2\" -type f | wc -l; echo \"---size---\"; du -sh \"/media/kapost/Schemsis/Midi - Copy/ViR2\" 2>&1)",
+      "Read(//media/kapost/Schemsis/Midi - Copy/ViR2/**)",
+      "Bash(rm -rf \"/media/kapost/Schemsis/Midi - Copy/ViR2\")",
+      "Bash(cd \"/media/kapost/Schemsis/Midi - Copy\" *)",
+      "Bash(cat)",
+      "Bash(python3 /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/analyze_dupes2.py)",
+      "Bash(python3 -m py_compile /home/kapost/drum_bass_human/dedup_midi_library.py)",
+      "Bash(rm -rf /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/SomeRandomPack/subfolder)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/EmptyOne/EmptyTwo)",
+      "Bash(touch /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/SomeRandomPack/header)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/000123@RANDOM_EZD)"
     ]
   }
 }
