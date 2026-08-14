@@ -20,6 +20,11 @@ grooves in a library, and auto-detecting theme/section boundaries in a song.
 - **drum_bass_studio.py** - the main all-in-one app. Combines the humanizer +
   segmentation model + bass sync into one window: drop a song's drum+bass MIDI,
   segment it, humanize each segment, tweak rush/drag, sync bass, render.
+- **parse_midi_library.py** - standalone housekeeping tool for a large *external*
+  MIDI sample library (not part of the humanizer pipeline itself — it just
+  tidies up a folder of purchased/downloaded MIDI packs). Prunes unwanted
+  genres, dedupes exact-duplicate files, flattens the folder structure, and
+  sorts long files out by length. See section 6 below.
 
 ## 1. Set up the environment (once)
 
@@ -99,6 +104,110 @@ python drum_bass_studio.py
 
 Both just open a window - drag/drop or Browse for the MIDI file(s), no other
 args needed.
+
+## 6. parse_midi_library.py - external MIDI library housekeeping
+
+A standalone script for cleaning up a large external folder of purchased/
+downloaded MIDI packs (mine lives at `/media/kapost/Schemsis/data`, an
+external drive - point it at wherever the equivalent folder is on this
+machine). Not part of the humanizer pipeline - just keeps the raw MIDI
+source library tidy before I feed any of it into `drum_humanizer_v3.py`'s
+`--mode cache` step.
+
+It has **four separate modes**, picked with a flag. Only one mode runs per
+invocation. Every mode defaults to a **dry run** (prints what it would do,
+changes nothing) - pass `--execute` to actually touch files. Renaming/moving
+modes also support `--preview N` to sample N random results without a full
+dry-run listing.
+
+**Arguments (all modes):**
+
+| Argument | Meaning |
+|---|---|
+| `base_dir` (positional, required) | Path to the library root, e.g. `"/media/kapost/Schemsis/data"` |
+| `--execute` | Actually delete/rename/move files. Without it, every mode is a dry run. |
+| `--preview N` | (flatten / move-by-measures / move-g24 only) Print N randomly sampled before -> after results instead of doing a full run. Implies dry run unless combined with `--execute`. |
+| `--seed N` | Random seed for `--preview` sampling, so repeated previews are reproducible. |
+| `--keep-format {sd3,ezd}` | (default mode only) Which plugin-format copy to keep when a groove was shipped for both Superior Drummer and EZdrummer/EZX. Default `sd3`. |
+| `--flatten` | Switch to flatten mode (see below). |
+| `--move-by-measures` | Switch to move-by-measures mode (see below). |
+| `--move-g24` | Switch to move-g24 mode (see below). |
+
+### Mode 1: default (no mode flag) - cleanup
+
+```bash
+python parse_midi_library.py "/media/kapost/Schemsis/data"            # dry run
+python parse_midi_library.py "/media/kapost/Schemsis/data" --execute  # for real
+```
+
+Runs 7 phases in order: delete the ViR2 pack (unconfirmed real-drummer
+provenance), delete specific unwanted genres (punk, jungle, rave, cha cha,
+marcha/rancho, afrobeat, NWOBHM, EDM, trance, industrial), delete house-genre
+folders + the Groove Monkee Electronic pack, dedupe exact-duplicate files by
+content hash (keeping the `--keep-format` plugin edition, or the `@`-numbered
+canonical folder for plain redundant copies), remove newly-empty folders,
+delete every `header` marker file, remove newly-empty folders again.
+Library-metadata marker files (`header`, `Aversion`, `kitpieces`, `midiDB`,
+`.dummy`, and anything 0 bytes) are protected from the dedup step since
+Toontrack/EZdrummer/BFD need their own local copy per pack folder to
+recognize it as valid content.
+
+### Mode 2: `--flatten` - rename into Company/Genre structure
+
+```bash
+python parse_midi_library.py "/media/kapost/Schemsis/data" --flatten --preview 20
+python parse_midi_library.py "/media/kapost/Schemsis/data" --flatten --execute
+```
+
+Rewrites every file from its deep, numbered, "@"-riddled original path into
+a flat `Company/Genre/renamed_file.ext` structure, e.g.:
+
+```
+data/210@GROOVE_MONKEE_BLUES/21@078 SLOW BLUES A/078 Slow Blues Hats (8) F1 S.mid
+  -> data/GROOVE/SLOW BLUES A/groove_Slow_Blues_Hats_(8)_F1S.mid
+```
+
+Folds as much of the original path into the filename as it can without
+repeating what's already implied (capped at 4 folder-lineage segments, with
+cross-segment word dedup and a library of word abbreviations like
+`straight`->`s`, `variation`->`v`, `fills`->`f`). Never overwrites - collisions
+get an incrementing `_2`, `_3`, ... suffix. Verifies the total file count is
+unchanged after `--execute`.
+
+### Mode 3: `--move-by-measures` - sort long files into songs/ and g48/
+
+```bash
+python parse_midi_library.py "/media/kapost/Schemsis/data" --move-by-measures --preview 20
+python parse_midi_library.py "/media/kapost/Schemsis/data" --move-by-measures --execute
+```
+
+Counts every `.mid`/`.midi` file's length in bars (via `pretty_midi`'s
+downbeat detection) and moves it into one of two new top-level folders,
+first match wins:
+1. `songs/` - "song" or "songs" appears anywhere in the file's old path
+   (case-insensitive) AND it's longer than 64 bars.
+2. `g48/` - longer than 48 bars (checked only if #1 didn't match).
+
+The old path is folded into the new filename so nothing about where a file
+came from is lost once it's sitting in a flat folder.
+
+### Mode 4: `--move-g24` - sort remaining 25-48 bar files into g24/
+
+```bash
+python parse_midi_library.py "/media/kapost/Schemsis/data" --move-g24 --preview 20
+python parse_midi_library.py "/media/kapost/Schemsis/data" --move-g24 --execute
+```
+
+Same idea, simpler: every `.mid`/`.midi` file **not already under `songs/` or
+`g48/`** that's longer than 24 bars moves into a new top-level `g24/` folder.
+Since mode 3 already relocated everything over 48 bars, this only picks up
+the 25-48 bar range. Run mode 3 first if starting from scratch - mode 4
+explicitly excludes `songs/` and `g48/` from its scan either way.
+
+**Suggested order on a fresh copy of the library:** mode 1 (cleanup) -> mode 2
+(flatten) -> mode 3 (move-by-measures) -> mode 4 (move-g24). Each mode
+defaults to a dry run, so it's safe to just run each one first and read the
+output before adding `--execute`.
 
 ## Quick order of operations (from nothing)
 

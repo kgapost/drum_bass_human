@@ -4,7 +4,7 @@
  MIDI LIBRARY CLEANUP  (genre pruning + exact-duplicate dedup + empty dirs)
 ==============================================================================
 Reproduces, on any copy of the same MIDI library, the cleanup done by hand on
-the original: /media/kapost/Schemsis/Midi - Copy
+the original: /media/kapost/Schemsis/data
 
 FOUR PHASES, IN ORDER
 ----------------------
@@ -33,23 +33,120 @@ FOUR PHASES, IN ORDER
      content. Deleting them would break the library, not just save space.
   5) Remove any directories left empty by the above (repeated until none
      remain, since removing one can empty its parent).
+  6) Delete every "header" marker file in the library, unconditionally. NOTE:
+     these are the same per-folder marker files phase 4 deliberately protects
+     from dedup because Toontrack/EZdrummer/BFD use them to recognize a pack
+     folder as valid content — deleting them everywhere may stop those
+     plugins from browsing/loading the affected packs. This phase exists
+     because it was explicitly requested; it is NOT implied by phases 1-5.
+  7) Remove newly-empty directories left behind by phase 6.
 
 USAGE
 -----
-  python dedup_midi_library.py "/path/to/Midi - Copy"            # dry run
-  python dedup_midi_library.py "/path/to/Midi - Copy" --execute  # for real
+  python parse_midi_library.py "/path/to/data"            # dry run
+  python parse_midi_library.py "/path/to/data" --execute  # for real
 
 Defaults to a DRY RUN that only prints what it would do. Pass --execute to
 actually delete anything.
+
+FILENAME FLATTENING  (separate mode, run with --flatten)
+----------------------------------------------------------
+Rewrites every file from its deep, numbered, "@"-riddled original path into
+a flat "Company/Genre/renamed_file.ext" structure:
+
+  data/210@GROOVE_MONKEE_BLUES/21@078 SLOW BLUES A/078 Slow Blues Hats (8) F1 S.mid
+    -> data/GROOVE/SLOW BLUES A/groove_078_Slow_Blues_Hats_(8)_F1_S.mid
+
+  data/14@EZX_METALHEADS/098-S113@THEME/Variation_01.mid
+    -> data/EZX/S113-THEME/ezx_metalheads_s113_theme_Variation_01.mid
+
+Rules:
+  - COMPANY = the first word of the top-level folder (after stripping its
+    leading "NN@" enumeration), e.g. "GROOVE_MONKEE_BLUES" -> "GROOVE",
+    "EZX_METALHEADS" -> "EZX". Always kept, always in the filename.
+  - GENRE folder (a single subfolder under COMPANY) = every folder between
+    the top level and the file, each stripped of its enumeration/"@"/leading
+    tempo number and joined with " - " if there's more than one. Falls back
+    to the top-level folder's remainder (e.g. "METALHEADS") if there are no
+    folders in between.
+  - The new filename is prefixed with the lineage that produced the GENRE
+    folder (lowercased, "_"-joined) — but a lineage segment (the top-level
+    remainder, or an individual in-between folder) is DROPPED from the
+    filename prefix if any of its words already appear in the original
+    filename, so the name doesn't repeat what it already says. COMPANY is
+    never dropped. The original filename's own text is preserved verbatim
+    (case and all) after the prefix, just with spaces turned into "_" and a
+    leading standalone tempo/index number stripped.
+  - Spaces anywhere in the new filename become "_". Characters illegal on
+    Windows/macOS/Linux filenames are stripped.
+  - Never overwrites: if the computed new path already exists (on disk, or
+    was already claimed earlier in the same run), an incrementing "_2",
+    "_3", ... is appended before the extension until it's unique.
+
+USAGE
+-----
+  python parse_midi_library.py "/path/to/data" --flatten --preview 20
+      # print 20 randomly sampled OLD -> NEW path pairs, changes nothing
+
+  python parse_midi_library.py "/path/to/data" --flatten --execute
+      # actually rename every file
+
+MOVE-BY-MEASURES  (separate mode, run with --move-by-measures)
+------------------------------------------------------------------
+Scans every .mid/.midi file, counts its length in measures (bars) via
+pretty_midi's downbeat detection, and moves it into one of two new
+top-level folders under the library root — each file goes to AT MOST ONE
+destination, decided in this priority order:
+
+  1) "songs/"  — file's filename OR path contains "song" or "songs"
+                 (case-insensitive) AND it's longer than 64 measures.
+  2) "g48/"    — (checked only if #1 didn't match) file is longer than
+                 48 measures.
+  3) otherwise — left where it is.
+
+The new filename keeps the file's former directory path folded into it
+(same "_"-joined, space-safe convention as the flatten mode above), so
+nothing about where it came from is lost even though it's now sitting in a
+flat folder. Never overwrites — colliding names get an incrementing
+"_2", "_3", ... suffix.
+
+USAGE
+-----
+  python parse_midi_library.py "/path/to/data" --move-by-measures --preview 20
+      # dry run, print 20 sampled OLD -> NEW moves + destination counts
+
+  python parse_midi_library.py "/path/to/data" --move-by-measures --execute
+      # actually move everything
+
+MOVE-G24  (separate mode, run with --move-g24)
+-------------------------------------------------
+Same idea as move-by-measures, but simpler: every .mid/.midi file NOT
+already under songs/ or g48/ that's longer than 24 bars moves into a new
+top-level g24/ folder, same path-folded-filename convention. Since
+move-by-measures already relocated everything over 48 bars, this only
+picks up files in the 25-48 bar range.
+
+USAGE
+-----
+  python parse_midi_library.py "/path/to/data" --move-g24 --preview 20
+  python parse_midi_library.py "/path/to/data" --move-g24 --execute
 """
 
 import argparse
 import collections
 import hashlib
 import os
+import random
 import re
 import shutil
 import sys
+import warnings
+
+try:
+    import pretty_midi
+    HAS_PRETTY_MIDI = True
+except ImportError:
+    HAS_PRETTY_MIDI = False
 
 # Which plugin-format copy to KEEP when a groove was shipped for both
 # Superior Drummer (native) and EZdrummer/EZX ("_EZD" suffix or "EZX" in the
@@ -357,8 +454,8 @@ def phase_dedupe_by_hash(base, dry_run, keep_format="sd3"):
 # -----------------------------------------------------------------------
 # PHASE 5 — empty directories
 # -----------------------------------------------------------------------
-def phase_remove_empty_dirs(base, dry_run):
-    print("\n=== Phase 5: empty directories ===")
+def phase_remove_empty_dirs(base, dry_run, label="Phase 5"):
+    print(f"\n=== {label}: empty directories ===")
     total = 0
     rounds = 0
     while True:
@@ -382,19 +479,584 @@ def phase_remove_empty_dirs(base, dry_run):
                 total += 1
             except OSError:
                 pass
-    print(f"  Phase 5 total: {total} empty directories removed")
+    print(f"  {label} total: {total} empty directories removed")
     return total
+
+
+# -----------------------------------------------------------------------
+# PHASE 6 — delete "header" marker files (unconditional)
+# -----------------------------------------------------------------------
+def phase_delete_header_files(base, dry_run):
+    print("\n=== Phase 6: delete 'header' files ===")
+    targets = []
+    for root, _dirs, files in os.walk(base):
+        for fname in files:
+            if fname.lower() == "header":
+                targets.append(os.path.join(root, fname))
+
+    print(f"  Found {len(targets)} 'header' files.")
+    deleted = 0
+    for p in targets:
+        print(f"  {'[DRY RUN] would delete' if dry_run else 'deleting'}: {p}")
+        if not dry_run:
+            try:
+                os.remove(p)
+                deleted += 1
+            except OSError as e:
+                print(f"  failed to delete {p}: {e}")
+    if dry_run:
+        deleted = len(targets)
+    print(f"  Phase 6 total: {deleted} 'header' files deleted")
+    return deleted
+
+
+# -----------------------------------------------------------------------
+# FILENAME FLATTENING  (separate mode — see module docstring for the rules)
+# -----------------------------------------------------------------------
+ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+LEADING_NUMBER_RE = re.compile(r'^\d+[\s_]+')
+ENUM_PREFIX_RE = re.compile(r'^\d+@')
+WORD_SPLIT_RE = re.compile(r'[^A-Za-z0-9]+')
+
+
+def sanitize_piece(s):
+    """For filename pieces: spaces become '_' (per the 'replace spaces from
+    filename with _' rule)."""
+    s = ILLEGAL_CHARS_RE.sub('', s)
+    s = re.sub(r'\s+', '_', s.strip())
+    return s.strip('_ -') or "Misc"
+
+
+def sanitize_folder_piece(s):
+    """For folder names: spaces are kept (only the FILENAME rule replaces
+    them), just collapsed and illegal characters stripped."""
+    s = ILLEGAL_CHARS_RE.sub('', s)
+    s = re.sub(r'\s+', ' ', s.strip())
+    return s.strip(' _-') or "Misc"
+
+
+def words_of(s):
+    """Word set used for redundancy checks. Also adds a naive singular form
+    for words ending in 's' (len > 3), so e.g. a folder's 'VARIATIONS' is
+    recognized as redundant with a filename that already says 'Variation' —
+    this is what makes the '.../VARIATIONS_01/Variation 003.mid' case drop
+    the folder-derived duplicate instead of keeping both "v01" and "v003"."""
+    words = set()
+    for w in WORD_SPLIT_RE.split(s):
+        if not w:
+            continue
+        wl = w.lower()
+        words.add(wl)
+        if len(wl) > 3 and wl.endswith('s'):
+            words.add(wl[:-1])
+    return words
+
+
+# Word/phrase abbreviations applied to the final filename text. Order matters:
+# multi-word phrases (e.g. "pre chorus") must come before the single-word
+# rule they contain (e.g. "chorus"), or the single-word rule would fire first
+# and leave the phrase half-abbreviated. All case-insensitive (re.I).
+#
+# NOTE: regex \b treats '_' as a word character, so it does NOT see a
+# boundary in "..._fills_..." (both neighbors of "fills" are \w chars) — it
+# would silently fail to match almost everywhere in this pipeline, since
+# everything gets underscore-joined. WB/WE below are custom boundaries that
+# only require "not a letter/digit" on each side, so '_', '-', space, start
+# and end of string all count as real separators.
+WB = r'(?<![A-Za-z0-9])'
+WE = r'(?![A-Za-z0-9])'
+ABBREVIATIONS = [
+    (re.compile(WB + r'pre[ _-]chorus' + WE, re.I), 'pch'),
+    (re.compile(WB + r'chorus' + WE, re.I), 'ch'),
+    (re.compile(WB + r'verse' + WE, re.I), 'vrs'),
+    (re.compile(WB + r'variations?[ _]?', re.I), 'v'),
+    (re.compile(WB + r'straight[ _-]?', re.I), 's'),
+    (re.compile(WB + r'fills' + WE, re.I), 'f'),
+    (re.compile(WB + r'backbeat' + WE, re.I), 'bb'),
+    (re.compile(WB + r'groove[ _]monke[a-z]*' + WE, re.I), 'gm'),
+    (re.compile(WB + r'grooves' + WE, re.I), ''),
+    (re.compile(WB + r'jazzy' + WE, re.I), 'jazz'),
+    (re.compile(WB + r'pop[ _-]rock' + WE, re.I), 'pop'),
+    (re.compile(WB + r'theme' + WE, re.I), 'thm'),
+    (re.compile(WB + r'bridge' + WE, re.I), 'brdg'),
+    (re.compile(WB + r'midtempo' + WE, re.I), 'midtmp'),
+    (re.compile(WB + r'uptempo' + WE, re.I), 'uptmp'),
+    (re.compile(WB + r'swing' + WE, re.I), 'swg'),
+    (re.compile(WB + r'essentials?' + WE, re.I), ''),
+    # words below chosen from an actual frequency scan of this library's
+    # folder-lineage words (not guessed) — counts as of the scan that added them:
+    # snare 120, toms/tom 169, ride 322, crash 157, hats 682, cymbal 288,
+    # shuffle 155, outro 91, percussion 680, pack 653, the 925
+    (re.compile(WB + r'snare' + WE, re.I), 'sn'),
+    (re.compile(WB + r'toms?' + WE, re.I), 'tm'),
+    (re.compile(WB + r'ride' + WE, re.I), 'rd'),
+    (re.compile(WB + r'crash' + WE, re.I), 'csh'),
+    (re.compile(WB + r'hats' + WE, re.I), 'ht'),
+    (re.compile(WB + r'cymbal' + WE, re.I), 'cym'),
+    (re.compile(WB + r'shuffle' + WE, re.I), 'shf'),
+    (re.compile(WB + r'outro' + WE, re.I), 'otr'),
+    (re.compile(WB + r'percussion' + WE, re.I), 'perc'),
+    (re.compile(WB + r'pack' + WE, re.I), ''),
+    (re.compile(WB + r'the' + WE, re.I), ''),
+]
+
+MAX_LINEAGE_SEGMENTS = 4  # cap on how many folder-derived segments get folded into the filename
+
+
+def apply_abbreviations(s):
+    for pattern, repl in ABBREVIATIONS:
+        s = pattern.sub(repl, s)
+    return s
+
+
+def collapse_repeats(s):
+    """'--' -> '-', '__' -> '_', '  ' -> ' ' (any run length)."""
+    s = re.sub(r'_{2,}', '_', s)
+    s = re.sub(r'-{2,}', '-', s)
+    s = re.sub(r' {2,}', ' ', s)
+    return s
+
+
+def normalize_spacing(s):
+    """Space-cleanup rules, applied in this order:
+    ' _ ' -> '_', ' - ' -> '-', '_-_' -> '-', then spaces directly between a
+    letter and a digit are removed, spaces between letter-letter or
+    digit-digit are turned into '_', and anything left over (e.g. a space
+    next to punctuation like a parenthesis) falls back to the general
+    'replace spaces with _' rule."""
+    s = s.replace(' _ ', '_')
+    s = s.replace(' - ', '-')
+    s = s.replace('_-_', '-')
+    s = re.sub(r'(?<=[A-Za-z]) (?=[0-9])', '', s)
+    s = re.sub(r'(?<=[0-9]) (?=[A-Za-z])', '', s)
+    s = re.sub(r'(?<=[A-Za-z]) (?=[A-Za-z])', '_', s)
+    s = re.sub(r'(?<=[0-9]) (?=[0-9])', '_', s)
+    s = re.sub(r'\s+', '_', s)  # anything left over
+    return s
+
+
+def extract_company(top_folder_name):
+    """'210@GROOVE_MONKEE_BLUES' -> ('GROOVE', 'MONKEE_BLUES')
+    '14@EZX_METALHEADS' -> ('EZX', 'METALHEADS')"""
+    name = ENUM_PREFIX_RE.sub('', top_folder_name)
+    parts = re.split(r'[_\-\s]+', name, maxsplit=1)
+    company = parts[0].strip() if parts and parts[0].strip() else "MISC"
+    remainder = parts[1].strip() if len(parts) > 1 else ""
+    return company, remainder
+
+
+def clean_folder_component(name):
+    """Strip enumeration/@-prefixes and leading tempo numbers.
+    '21@078 SLOW BLUES A' -> 'SLOW BLUES A'
+    '098-S113@THEME' -> 'S113-THEME'"""
+    if "@" in name:
+        prefix, suffix = name.split("@", 1)
+        suffix = suffix.strip()
+        if prefix.isdigit() or not prefix:
+            code = ""
+        else:
+            segments = [s for s in prefix.split("-") if s]
+            non_numeric = [s for s in segments if not s.isdigit()]
+            code = non_numeric[-1] if non_numeric else ""
+        name = f"{code}-{suffix}" if code else suffix
+    name = LEADING_NUMBER_RE.sub('', name)
+    return name.strip(' _-')
+
+
+def compute_new_name(base, path):
+    """Returns (new_dir_abs_path, new_filename) for `path` under `base`,
+    per the rules in the module docstring."""
+    rel = os.path.relpath(path, base)
+    parts = rel.split(os.sep)
+    filename = parts[-1]
+    top = parts[0] if len(parts) > 1 else ""
+    middle = parts[1:-1]
+
+    name, ext = os.path.splitext(filename)
+
+    if top:
+        company, top_remainder = extract_company(top)
+    else:
+        company, top_remainder = "MISC", ""
+    company = company.upper()
+
+    cleaned_middle = [c for c in (clean_folder_component(m) for m in middle) if c]
+
+    genre_parts = list(cleaned_middle)
+    if not genre_parts and top_remainder:
+        genre_parts = [top_remainder]
+    genre = " - ".join(genre_parts) if genre_parts else "Misc"
+
+    filename_words = words_of(name)
+
+    # Step 1: drop whole segments (top-level remainder, or an in-between
+    # folder) that are already redundant with the original filename.
+    candidate_segments = []
+    if top_remainder and not (words_of(top_remainder) & filename_words):
+        candidate_segments.append(top_remainder)
+    for cleaned in cleaned_middle:
+        if words_of(cleaned) & filename_words:
+            continue
+        candidate_segments.append(cleaned)
+
+    # Step 2: cap how many segments get folded into the filename, keeping
+    # the deepest/most specific ones (closest to the file).
+    if len(candidate_segments) > MAX_LINEAGE_SEGMENTS:
+        candidate_segments = candidate_segments[-MAX_LINEAGE_SEGMENTS:]
+
+    # Step 3: dedup words across segments (and against the company), so a
+    # nested pack like ".../GROOVE_MONKEE_FUSION/GROOVE_MONKEE_FUSION_NASHVILLE/..."
+    # doesn't repeat "groove monkee fusion" twice — only genuinely new words
+    # from each segment, in order, survive.
+    used_words = set(words_of(company))
+    lineage_tokens = []
+    for seg in candidate_segments:
+        for w in re.split(r'[\s_\-]+', seg):
+            if not w or (len(w) <= 1 and not w.isdigit()):
+                continue  # drop stray single letters (noise like "A"), keep single digits (often meaningful, e.g. version numbers)
+            if w.lower() in used_words:
+                continue
+            used_words.add(w.lower())
+            lineage_tokens.append(w)
+
+    prefix_words = [company.lower()] + [t.lower() for t in lineage_tokens if t]
+
+    # original filename text, kept as-is (own casing, own spacing/punctuation)
+    # aside from stripping a leading standalone tempo/index number — the
+    # abbreviation + spacing rules run on the WHOLE combined string below.
+    raw_original = LEADING_NUMBER_RE.sub('', name).strip()
+
+    # Safety nets: make sure genre and "song" (if present anywhere in the
+    # original path) survive into the filename, even if the redundancy
+    # check above would otherwise have dropped them.
+    def combined_lower():
+        return ("_".join(prefix_words) + "_" + raw_original).lower()
+
+    genre_words = words_of(genre)
+    if genre_words and not (genre_words & words_of(combined_lower())):
+        prefix_words.extend(w.lower() for w in re.split(r'[\s_\-]+', genre) if w)
+
+    path_components = ([top] if top else []) + list(middle)
+    if any('song' in c.lower() for c in path_components) and 'song' not in combined_lower():
+        prefix_words.append('song')
+
+    full_raw = "_".join(prefix_words) + "_" + raw_original if prefix_words else raw_original
+    full_raw = apply_abbreviations(full_raw)
+    full_raw = normalize_spacing(full_raw)
+    full_raw = collapse_repeats(full_raw)
+    full_raw = ILLEGAL_CHARS_RE.sub('', full_raw).strip('_ -') or "file"
+
+    new_filename = f"{full_raw}{ext}"
+
+    # keep filenames within common filesystem limits (255 bytes per component)
+    max_stem = 255 - len(ext.encode('utf-8')) - 1
+    stem, _ = os.path.splitext(new_filename)
+    if len(stem.encode('utf-8')) > max_stem:
+        stem = stem.encode('utf-8')[:max_stem].decode('utf-8', errors='ignore')
+        new_filename = f"{stem}{ext}"
+
+    new_dir = os.path.join(base, sanitize_folder_piece(company), sanitize_folder_piece(genre))
+    return new_dir, new_filename
+
+
+def make_unique(candidate, used_paths):
+    if candidate not in used_paths and not os.path.exists(candidate):
+        return candidate
+    root, ext = os.path.splitext(candidate)
+    i = 2
+    while True:
+        alt = f"{root}_{i}{ext}"
+        if alt not in used_paths and not os.path.exists(alt):
+            return alt
+        i += 1
+
+
+def phase_flatten_filenames(base, dry_run, preview_count=None, seed=None):
+    print("\n=== Flatten: rename files into Company/Genre structure ===")
+    all_files = []
+    for root, _dirs, files in os.walk(base):
+        for fname in files:
+            all_files.append(os.path.join(root, fname))
+    print(f"  Found {len(all_files)} files.")
+
+    if preview_count:
+        rng = random.Random(seed)
+        sample = rng.sample(all_files, min(preview_count, len(all_files)))
+        print(f"  Preview of {len(sample)} random renames (nothing will be changed):")
+        for p in sample:
+            new_dir, new_filename = compute_new_name(base, p)
+            rel_old = os.path.relpath(p, base)
+            rel_new = os.path.relpath(os.path.join(new_dir, new_filename), base)
+            print(f"    {rel_old}")
+            print(f"      -> {rel_new}")
+        return 0
+
+    used_paths = set()
+    renamed = 0
+    for p in all_files:
+        new_dir, new_filename = compute_new_name(base, p)
+        candidate = make_unique(os.path.join(new_dir, new_filename), used_paths)
+        used_paths.add(candidate)
+        if dry_run:
+            continue
+        try:
+            os.makedirs(os.path.dirname(candidate), exist_ok=True)
+            shutil.move(p, candidate)
+            renamed += 1
+        except OSError as e:
+            print(f"  failed to move {p} -> {candidate}: {e}")
+
+    if dry_run:
+        print(f"  [DRY RUN] would rename {len(all_files)} files. Re-run with --execute to apply, "
+              f"or use --preview N to sample results first.")
+    else:
+        print(f"  Renamed {renamed} files.")
+        after_count = sum(len(files) for _root, _dirs, files in os.walk(base))
+        if after_count == len(all_files):
+            print(f"  Verified: file count unchanged ({len(all_files)} before, {after_count} after).")
+        else:
+            print(f"  WARNING: file count MISMATCH — {len(all_files)} before, {after_count} after. "
+                  f"Investigate before trusting the result.")
+    return renamed
+
+
+# -----------------------------------------------------------------------
+# MOVE-BY-MEASURES  (separate mode — see module docstring for the rules)
+# -----------------------------------------------------------------------
+def count_measures(path):
+    """Approximate bar/measure count via pretty_midi's downbeat detection.
+    Returns None if the file can't be parsed."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pm = pretty_midi.PrettyMIDI(path)
+            return len(pm.get_downbeats())
+    except Exception:
+        return None
+
+
+def build_path_folded_filename(base, path):
+    """'GROOVE/SLOW BLUES A/groove_..._Hats.mid' -> 'GROOVE_SLOW_BLUES_A_groove_..._Hats.mid'
+    Folds every directory level between `base` and the file into the
+    filename, so moving it into a flat destination folder doesn't lose
+    where it came from."""
+    rel = os.path.relpath(path, base)
+    parts = rel.split(os.sep)
+    dirs, filename = parts[:-1], parts[-1]
+    prefix = "_".join(sanitize_piece(d) for d in dirs if d)
+    combined = f"{prefix}_{filename}" if prefix else filename
+    return collapse_repeats(combined)
+
+
+def phase_move_by_measures(base, dry_run, preview_count=None, seed=None):
+    print("\n=== Move by measures: songs/ (>64 bars, 'song' in path) + g48/ (>48 bars) ===")
+    if not HAS_PRETTY_MIDI:
+        print("  ERROR: pretty_midi is not installed — cannot count measures. "
+              "Install it with: pip install pretty_midi")
+        return 0
+
+    songs_dir = os.path.join(base, "songs")
+    g48_dir = os.path.join(base, "g48")
+    skip_tops = {"songs", "g48"}
+
+    candidates = []
+    for root, dirs, files in os.walk(base):
+        rel_root = os.path.relpath(root, base)
+        top = rel_root.split(os.sep)[0] if rel_root != "." else ""
+        if top in skip_tops:
+            dirs[:] = []  # don't descend into the destination folders
+            continue
+        for fname in files:
+            if fname.lower().endswith((".mid", ".midi")):
+                candidates.append(os.path.join(root, fname))
+
+    print(f"  Scanning {len(candidates)} .mid/.midi files for measure counts "
+          f"(this parses every file, so it takes a while)...")
+
+    decisions = []  # (path, destination_dir, measures)
+    n_scanned = 0
+    n_failed = 0
+    for p in candidates:
+        n_scanned += 1
+        if n_scanned % 10000 == 0:
+            print(f"  ...scanned {n_scanned}/{len(candidates)}")
+        measures = count_measures(p)
+        if measures is None:
+            n_failed += 1
+            continue
+        rel = os.path.relpath(p, base).lower()
+        if "song" in rel and measures > 64:
+            decisions.append((p, songs_dir, measures))
+        elif measures > 48:
+            decisions.append((p, g48_dir, measures))
+
+    n_songs = sum(1 for _p, d, _m in decisions if d == songs_dir)
+    n_g48 = sum(1 for _p, d, _m in decisions if d == g48_dir)
+    print(f"  Scanned {n_scanned} files ({n_failed} unreadable, skipped).")
+    print(f"  -> songs/ : {n_songs} files (>64 bars, 'song' in path)")
+    print(f"  -> g48/   : {n_g48} files (>48 bars)")
+
+    if preview_count:
+        rng = random.Random(seed)
+        sample = rng.sample(decisions, min(preview_count, len(decisions)))
+        print(f"  Preview of {len(sample)} random moves (nothing will be changed):")
+        for p, dest_dir, measures in sample:
+            new_filename = build_path_folded_filename(base, p)
+            rel_old = os.path.relpath(p, base)
+            rel_new = os.path.relpath(os.path.join(dest_dir, new_filename), base)
+            print(f"    [{measures} bars] {rel_old}")
+            print(f"      -> {rel_new}")
+        return 0
+
+    if dry_run:
+        print(f"  [DRY RUN] would move {len(decisions)} files. Re-run with --execute to apply, "
+              f"or use --preview N to sample results first.")
+        return 0
+
+    before_total = sum(len(files) for _root, _dirs, files in os.walk(base))
+
+    used_paths = set()
+    moved = 0
+    for p, dest_dir, _measures in decisions:
+        new_filename = build_path_folded_filename(base, p)
+        candidate = make_unique(os.path.join(dest_dir, new_filename), used_paths)
+        used_paths.add(candidate)
+        try:
+            os.makedirs(os.path.dirname(candidate), exist_ok=True)
+            shutil.move(p, candidate)
+            moved += 1
+        except OSError as e:
+            print(f"  failed to move {p} -> {candidate}: {e}")
+
+    print(f"  Moved {moved} files.")
+    after_total = sum(len(files) for _root, _dirs, files in os.walk(base))
+    if after_total == before_total:
+        print(f"  Verified: total file count unchanged ({before_total} before, {after_total} after).")
+    else:
+        print(f"  WARNING: file count MISMATCH — {before_total} before, {after_total} after. "
+              f"Investigate before trusting the result.")
+    return moved
+
+
+def phase_move_above_measures(base, dry_run, threshold, dest_name, exclude_tops=(),
+                               preview_count=None, seed=None):
+    """General single-criterion version of the songs/g48 mover above: move
+    every .mid/.midi file longer than `threshold` bars into a new top-level
+    `dest_name`/ folder, excluding files already under any of `exclude_tops`
+    (and under `dest_name` itself, so reruns are safe). Same path-folded
+    filename convention, same never-overwrite/uniqueness handling, same
+    before/after file-count verification."""
+    print(f"\n=== Move by measures: {dest_name}/ (>{threshold} bars) ===")
+    if not HAS_PRETTY_MIDI:
+        print("  ERROR: pretty_midi is not installed — cannot count measures. "
+              "Install it with: pip install pretty_midi")
+        return 0
+
+    dest_dir = os.path.join(base, dest_name)
+    skip_tops = set(exclude_tops) | {dest_name}
+
+    candidates = []
+    for root, dirs, files in os.walk(base):
+        rel_root = os.path.relpath(root, base)
+        top = rel_root.split(os.sep)[0] if rel_root != "." else ""
+        if top in skip_tops:
+            dirs[:] = []
+            continue
+        for fname in files:
+            if fname.lower().endswith((".mid", ".midi")):
+                candidates.append(os.path.join(root, fname))
+
+    print(f"  Scanning {len(candidates)} .mid/.midi files "
+          f"(excluding {', '.join(sorted(skip_tops))}/) for measure counts...")
+
+    decisions = []  # (path, measures)
+    n_scanned = 0
+    n_failed = 0
+    for p in candidates:
+        n_scanned += 1
+        if n_scanned % 10000 == 0:
+            print(f"  ...scanned {n_scanned}/{len(candidates)}")
+        measures = count_measures(p)
+        if measures is None:
+            n_failed += 1
+            continue
+        if measures > threshold:
+            decisions.append((p, measures))
+
+    print(f"  Scanned {n_scanned} files ({n_failed} unreadable, skipped).")
+    print(f"  -> {dest_name}/ : {len(decisions)} files (>{threshold} bars)")
+
+    if preview_count:
+        rng = random.Random(seed)
+        sample = rng.sample(decisions, min(preview_count, len(decisions)))
+        print(f"  Preview of {len(sample)} random moves (nothing will be changed):")
+        for p, measures in sample:
+            new_filename = build_path_folded_filename(base, p)
+            rel_old = os.path.relpath(p, base)
+            rel_new = os.path.relpath(os.path.join(dest_dir, new_filename), base)
+            print(f"    [{measures} bars] {rel_old}")
+            print(f"      -> {rel_new}")
+        return 0
+
+    if dry_run:
+        print(f"  [DRY RUN] would move {len(decisions)} files. Re-run with --execute to apply, "
+              f"or use --preview N to sample results first.")
+        return 0
+
+    before_total = sum(len(files) for _root, _dirs, files in os.walk(base))
+
+    used_paths = set()
+    moved = 0
+    for p, _measures in decisions:
+        new_filename = build_path_folded_filename(base, p)
+        candidate = make_unique(os.path.join(dest_dir, new_filename), used_paths)
+        used_paths.add(candidate)
+        try:
+            os.makedirs(os.path.dirname(candidate), exist_ok=True)
+            shutil.move(p, candidate)
+            moved += 1
+        except OSError as e:
+            print(f"  failed to move {p} -> {candidate}: {e}")
+
+    print(f"  Moved {moved} files.")
+    after_total = sum(len(files) for _root, _dirs, files in os.walk(base))
+    if after_total == before_total:
+        print(f"  Verified: total file count unchanged ({before_total} before, {after_total} after).")
+    else:
+        print(f"  WARNING: file count MISMATCH — {before_total} before, {after_total} after. "
+              f"Investigate before trusting the result.")
+    return moved
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("base_dir", help="Path to the MIDI library root (e.g. 'Midi - Copy')")
+    parser.add_argument("base_dir", help="Path to the MIDI library root (e.g. 'data')")
     parser.add_argument("--execute", action="store_true",
                          help="Actually delete files/folders. Without this flag, it's a dry run.")
     parser.add_argument("--keep-format", choices=["sd3", "ezd"], default=KEEP_FORMAT,
                          help="Which plugin-format copy to keep in format-duality pairs "
                               "(default: %(default)s)")
+    parser.add_argument("--flatten", action="store_true",
+                         help="Run ONLY the filename-flattening rename (Company/Genre/renamed_file), "
+                              "instead of the cleanup phases. Combine with --preview to sample "
+                              "results first, or --execute to actually rename everything.")
+    parser.add_argument("--preview", type=int, default=None, metavar="N",
+                         help="With --flatten and without --execute: print N randomly sampled "
+                              "proposed renames without changing anything.")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Random seed for --preview sampling (reproducible previews).")
+    parser.add_argument("--move-by-measures", action="store_true",
+                         help="Run ONLY the measures-based move (songs/ for >64-bar files with "
+                              "'song' in their path, g48/ for >48-bar files), instead of the "
+                              "cleanup phases. Combine with --preview to sample results first, "
+                              "or --execute to actually move everything.")
+    parser.add_argument("--move-g24", action="store_true",
+                         help="Run ONLY a move of every .mid/.midi file (not already under "
+                              "songs/ or g48/) longer than 24 bars into a new top-level g24/ "
+                              "folder, same path-folded-filename convention. Combine with "
+                              "--preview to sample results first, or --execute to actually "
+                              "move everything.")
     args = parser.parse_args()
 
     base = os.path.abspath(args.base_dir)
@@ -405,6 +1067,43 @@ def main():
     dry_run = not args.execute
     print(f"Base directory: {base}")
     print(f"Mode: {'DRY RUN (no changes will be made)' if dry_run else 'EXECUTE (files will be deleted)'}")
+
+    if args.flatten:
+        if args.preview and not args.execute:
+            phase_flatten_filenames(base, dry_run=True, preview_count=args.preview, seed=args.seed)
+        else:
+            phase_flatten_filenames(base, dry_run=dry_run)
+            if dry_run:
+                print("\nDry run complete. Re-run with --execute to actually rename anything.")
+            else:
+                print("\nDone.")
+        return
+
+    if args.move_by_measures:
+        if args.preview and not args.execute:
+            phase_move_by_measures(base, dry_run=True, preview_count=args.preview, seed=args.seed)
+        else:
+            phase_move_by_measures(base, dry_run=dry_run)
+            if dry_run:
+                print("\nDry run complete. Re-run with --execute to actually move anything.")
+            else:
+                print("\nDone.")
+        return
+
+    if args.move_g24:
+        exclude = ("songs", "g48")
+        if args.preview and not args.execute:
+            phase_move_above_measures(base, dry_run=True, threshold=24, dest_name="g24",
+                                       exclude_tops=exclude, preview_count=args.preview, seed=args.seed)
+        else:
+            phase_move_above_measures(base, dry_run=dry_run, threshold=24, dest_name="g24",
+                                       exclude_tops=exclude)
+            if dry_run:
+                print("\nDry run complete. Re-run with --execute to actually move anything.")
+            else:
+                print("\nDone.")
+        return
+
     print(f"Keep format: {args.keep_format}")
 
     phase_delete_vir2(base, dry_run)
@@ -412,6 +1111,8 @@ def main():
     phase_delete_house_and_electronic(base, dry_run)
     phase_dedupe_by_hash(base, dry_run, keep_format=args.keep_format)
     phase_remove_empty_dirs(base, dry_run)
+    phase_delete_header_files(base, dry_run)
+    phase_remove_empty_dirs(base, dry_run, label="Phase 7")
 
     if dry_run:
         print("\nDry run complete. Re-run with --execute to actually delete anything.")

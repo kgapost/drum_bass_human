@@ -26,7 +26,11 @@
       "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/SomeRandomPack/subfolder)",
       "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/EmptyOne/EmptyTwo)",
       "Bash(touch /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/SomeRandomPack/header)",
-      "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/000123@RANDOM_EZD)"
+      "Bash(mkdir -p /tmp/claude-1000/-home-kapost-drum-bass-human/b1dc1721-6338-4bc8-8b54-2c5a3af15ec0/scratchpad/fake_library/000123@RANDOM_EZD)",
+      "Bash(python3 -m py_compile /home/kapost/drum_bass_human/parse_midi_library.py)",
+      "Bash(python3 /home/kapost/drum_bass_human/parse_midi_library.py \"/media/kapost/Schemsis/Midi - Copy\" --execute)",
+      "Bash(python3 /home/kapost/drum_bass_human/parse_midi_library.py \"/media/kapost/Schemsis/Midi - Copy\" --flatten --preview 20 --seed 42)",
+      "Bash(python3 -)"
     ]
   }
 }
