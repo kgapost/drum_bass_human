@@ -3,9 +3,7 @@
  MIDI DRUM HUMANIZATION TRANSFORMER  (v3 - encoder-only)
 ==============================================================================
 
-WHAT THIS PROGRAM DOES
-----------------------
-It learns how a HUMAN drummer plays - the micro-timing pushes/pulls and the
+Learns how a HUMAN drummer plays - the micro-timing pushes/pulls and the
 velocity dynamics - from a corpus of human-performed MIDI drums (built for the
 Superior Drummer 3 groove library) and then applies that "feel" to stiff,
 quantized, programmed MIDI. It learns entirely from data: there are NO
@@ -16,7 +14,7 @@ It NEVER changes which notes you played. Every hit keeps its exact original
 pitch, so your specific kick/snare/tom/cymbal choices always survive untouched.
 The model only adjusts each hit's VELOCITY and TIMING.
 
-HOW IT WORKS (one-paragraph technical summary)
+HOW IT WORKS
 ----------------------------------------------
 Humanization is sequence LABELLING, not generation: the hits are fixed and known,
 and each input hit maps to exactly one (velocity, timing-offset) output. So the
@@ -64,10 +62,10 @@ CACHE MODE (build training data from MIDI)
   --section_bars N             section length in bars when splitting (default 16)
   --hop_bars N                 hop between sections; <section_bars = overlap (default 8)
   --no_quality_filter          keep flat/robotic sections (default: filter them out)
-  --min_velocity_std X         flat-dynamics reject threshold, vel std (default 4)
-  --min_velocity_range X       flat-dynamics reject threshold, vel range (default 12)
-  --min_offset_std X           flat-timing reject threshold, ticks std (default 2)
-  --min_offset_range X         flat-timing reject threshold, ticks range (default 6)
+  --min_velocity_std X         flat-dynamics reject threshold, vel std (default 8)
+  --min_velocity_range X       flat-dynamics reject threshold, vel range (default 24)
+  --min_offset_std X           flat-timing reject threshold, ticks std (default 4)
+  --min_offset_range X         flat-timing reject threshold, ticks range (default 12)
 
 TRAIN MODE
   --cache PATH                 training cache from cache mode
@@ -158,6 +156,7 @@ Search the source for "DESIGN:" to find inline rationale for any decision above.
 """
 
 import os
+import re
 import sys
 import glob
 import math
@@ -167,6 +166,7 @@ import pickle
 import random
 import argparse
 import traceback
+from collections import Counter
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -222,7 +222,7 @@ def seed_everything(seed: int = GLOBAL_SEED, verbose: bool = True):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if verbose:
-        print(f"[seed] All RNGs seeded with {seed} (random, numpy, torch/cuda).")
+        print(f"[seed] {seed}")
 
 
 def _worker_init_fn(worker_id: int):
@@ -349,10 +349,10 @@ class Config:
     # essentially a quantized robotic pattern. If it has real expression in either
     # dimension it is still a useful target for that dimension, so we keep it.
     quality_filter:      bool  = True
-    min_velocity_std:    float = 4.0    # MIDI-velocity units; below -> "flat dynamics"
-    min_velocity_range:  float = 12.0   # max-min MIDI velocity; below -> "flat dynamics"
-    min_offset_std:      float = 2.0    # ticks; below -> "flat/quantized timing"
-    min_offset_range:    float = 6.0    # max-min offset ticks; below -> "flat timing"
+    min_velocity_std:    float = 8.0    # MIDI-velocity units; below -> "flat dynamics"
+    min_velocity_range:  float = 24.0   # max-min MIDI velocity; below -> "flat dynamics"
+    min_offset_std:      float = 4.0    # ticks; below -> "flat/quantized timing"
+    min_offset_range:    float = 12.0   # max-min offset ticks; below -> "flat timing"
 
     # ── Bar-rotation augmentation (training only) ───────────────────────────────
     # A model that only ever sees files starting at bar 1 can over-index on phrase
@@ -772,36 +772,87 @@ def _locate_measure(measures, beat_pos):
     return lo, measures[lo]
 
 
-def load_midi_events(path: str, cfg: Config) -> Optional[List[DrumEvent]]:
+def load_midi_events(path: str, cfg: Config):
+    """Returns (events_or_None, reason). reason is None on success, otherwise a short
+    code explaining why the file yielded no usable events - see build_cache's summary,
+    which tallies these across the whole run so mass skips are diagnosable instead of
+    collapsing into one opaque 'failed' counter."""
     if not HAS_PRETTY_MIDI:
         raise ImportError("pretty_midi required for MIDI I/O")
     try:
         return _load_midi_events_impl(path, cfg)
     except Exception as exc:
         # One malformed file must never abort a whole cache build. Report which file
-        # and why (with the exact line), then signal "skip" by returning None.
+        # and why (with the exact line), then signal "skip" by returning None. Full
+        # per-file printing (not just tallying) is kept here because parse exceptions
+        # are rare/unexpected - unlike the routine 'no drum track' skip below.
         _report_error(f"parsing MIDI file '{os.path.basename(path)}'", exc)
-        return None
+        return None, f"exception:{type(exc).__name__}"
 
 
-def _load_midi_events_impl(path: str, cfg: Config) -> Optional[List[DrumEvent]]:
+_DRUM_NAME_RE = re.compile(r'drum|kit|perc|groove|beat', re.IGNORECASE)
+_NON_DRUM_NAME_RE = re.compile(
+    r'bass|guitar|piano|keys?|synth|vocal|lead|pad|string|brass|horn|organ|choir', re.IGNORECASE)
+
+
+def _get_drum_notes(midi):
+    """
+    Find the notes to treat as drums, with a fallback for files that don't follow
+    the MIDI-channel-10 convention. DESIGN: this cache builder is meant to run on
+    purchased/downloaded drum-GROOVE MIDI packs (Toontrack/EZdrummer/BFD/Groove
+    Monkee etc, see README) - single-purpose loop files, not full-band songs. Those
+    packs routinely park their one and only track on whatever channel the exporting
+    DAW defaulted to (often 1, not 10), so pretty_midi's is_drum flag misses them
+    entirely even though the file is unambiguously "all drums". We exploit that
+    single-purpose-file structure as the safety net: only fall back to treating
+    non-flagged notes as drums when there's no real ambiguity about what else they
+    could be (exactly one track has notes, or the track is explicitly named as
+    drums) - a multi-track file with an unnamed/ambiguous second part is left alone
+    rather than risk folding a bass or melodic line into the "drum" pitches.
+    Returns (notes, source) where source explains which path was used.
+    """
+    drum_tracks = [t for t in midi.instruments if t.is_drum]
+    if drum_tracks:
+        return [n for t in drum_tracks for n in t.notes], 'channel10'
+
+    non_empty = [t for t in midi.instruments if t.notes]
+    if not non_empty:
+        return [], 'no_notes'
+    if len(non_empty) == 1:
+        # only one part in the whole file - in a drum-loop-pack library this can
+        # only be the drum part, regardless of what channel it was exported on.
+        return list(non_empty[0].notes), 'single_track_fallback'
+
+    named_drum = [t for t in non_empty
+                  if _DRUM_NAME_RE.search(t.name or '') and not _NON_DRUM_NAME_RE.search(t.name or '')]
+    if named_drum:
+        return [n for t in named_drum for n in t.notes], 'name_match_fallback'
+
+    # multiple tracks, none flagged or named as drums - too ambiguous to guess
+    # (could be a full-band "_songs/" export); leave it for the caller to skip.
+    return [], 'ambiguous_multi_track'
+
+
+def _load_midi_events_impl(path: str, cfg: Config):
     midi = pretty_midi.PrettyMIDI(path)
-    notes = [n for t in midi.instruments if t.is_drum for n in t.notes]
+    notes, note_source = _get_drum_notes(midi)
     if not notes:
-        return None
+        return None, ("no_notes_at_all" if note_source == 'no_notes' else note_source)
     notes.sort(key=lambda n: n.start)
 
     measures, tempo = _build_measure_map(midi, cfg)
     if not measures:
-        return None
+        return None, "no_measure_map"
 
     tok = Tokenizer(cfg)
     events: List[DrumEvent] = []
+    unmapped_pitches = 0   # notes whose pitch isn't in GM_DRUM_MAP (e.g. extended VST articulation maps)
     last_time_by_inst = {}   # instrument -> last note start time (seconds), for flam detection
     flam_window_s = cfg.flam_window_ms / 1000.0
     for note in notes:
         inst = GM_DRUM_MAP.get(note.pitch, -1)
         if inst < 0:
+            unmapped_pitches += 1
             continue
         # absolute tick on the internal fixed grid (for offset/IOI math, unchanged)
         tick = int(note.start * (tempo / 60.0) * cfg.ticks_per_beat)
@@ -842,7 +893,14 @@ def _load_midi_events_impl(path: str, cfg: Config) -> Optional[List[DrumEvent]]:
             ts_id=ts, beat_slot=beat_slot,
             is_flam=is_flam, flam_gap_ms=flam_gap_ms, tempo_bpm=tempo,
         ))
-    return events or None
+    if events:
+        return events, note_source   # note_source is 'channel10' on the normal path,
+                                      # or the fallback used to recover a non-channel-10 file
+    # every drum-channel note existed but none of them mapped to a known GM pitch -
+    # distinct from "no drum channel at all" so an incomplete GM_DRUM_MAP is diagnosable.
+    if unmapped_pitches > 0:
+        return None, "all_pitches_unmapped"
+    return None, "no_notes_after_measure_mapping"
 
 
 def events_to_midi(events: List[DrumEvent], out_path: str, cfg: Config, tempo: float = 120.0):
@@ -1020,9 +1078,11 @@ def _process_one_file(args) -> Optional[Dict]:
     path, cfg = args[0], args[1]
     split = args[2] if len(args) > 2 else {}
     try:
-        events = load_midi_events(path, cfg)
-        if events is None or len(events) < 8:
-            return None
+        events, note_source = load_midi_events(path, cfg)
+        if events is None:
+            return {'_failed_reason': note_source}
+        if len(events) < 10:
+            return {'_failed_reason': 'too_few_events'}
         events.sort(key=lambda e: (e.bar, e.grid_step, e.instrument))
         tok = Tokenizer(cfg)
 
@@ -1047,6 +1107,8 @@ def _process_one_file(args) -> Optional[Dict]:
         # attach a small stats marker on the first sample so the builder can tally
         if out:
             out[0]['_rejected_sections'] = rejected
+            out[0]['_file_had_rejection'] = rejected > 0
+            out[0]['_note_source'] = note_source
         elif rejected:
             # everything got filtered out; signal it distinctly (not a parse failure)
             return {'_all_rejected': rejected}
@@ -1055,7 +1117,7 @@ def _process_one_file(args) -> Optional[Dict]:
         # runs in a worker process - report which file broke and skip it rather than
         # letting the whole pool crash with an opaque error.
         _report_error(f"processing MIDI file '{os.path.basename(path)}' in cache builder", exc)
-        return None
+        return {'_failed_reason': f'exception:{type(exc).__name__}'}
 
 
 def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 8,
@@ -1074,6 +1136,9 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
     split_opts = {'enabled': split_songs, 'section_bars': section_bars, 'hop_bars': hop_bars}
     samples, failed, rejected = [], 0, 0
     files_all_rejected = 0
+    files_partially_rejected = 0
+    failure_reasons = Counter()
+    note_sources = Counter()
     work = [(p, cfg, split_opts) for p in paths]
     with ProcessPoolExecutor(max_workers=num_workers) as ex:
         futures = [ex.submit(_process_one_file, w) for w in work]
@@ -1085,21 +1150,56 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
             if isinstance(r, dict) and '_all_rejected' in r:
                 rejected += r['_all_rejected']
                 files_all_rejected += 1
+            elif isinstance(r, dict) and '_failed_reason' in r:
+                failed += 1
+                failure_reasons[r['_failed_reason']] += 1
             elif r:                       # LIST of section-samples
                 rejected += r[0].pop('_rejected_sections', 0)
+                if r[0].pop('_file_had_rejection', False):
+                    files_partially_rejected += 1
+                note_sources[r[0].pop('_note_source', 'channel10')] += 1
                 samples.extend(r)
             else:
                 failed += 1
+                failure_reasons['empty_after_splitting'] += 1
+    files_affected = files_all_rejected + files_partially_rejected
     kept_files = len(paths) - failed - files_all_rejected
     print(f"  ✓ {len(samples)} section-samples kept from ~{kept_files} files")
     print(f"  ✗ {failed} failed/empty  |  {rejected} sections rejected as flat/robotic"
           f"  ({files_all_rejected} files fully rejected)")
+    fallback_recovered = note_sources.get('single_track_fallback', 0) + note_sources.get('name_match_fallback', 0)
+    if fallback_recovered:
+        print(f"  Recovered via non-channel-10 fallback: {fallback_recovered} files "
+              f"({note_sources.get('single_track_fallback', 0)} single-track, "
+              f"{note_sources.get('name_match_fallback', 0)} name-matched) "
+              f"- see build_cache/_get_drum_notes for the heuristic; spot-check a few "
+              f"if this number looks off.")
+    if failed:
+        print(f"  Why files failed (top reasons):")
+        for reason, count in failure_reasons.most_common(8):
+            pct = 100.0 * count / failed
+            print(f"    {count:>8}  ({pct:5.1f}%)  {reason}")
+        if failure_reasons.get('ambiguous_multi_track', 0) > failed * 0.1:
+            print(f"    -> Most failures are files with multiple tracks where none is on the "
+                  f"GM drum channel (10) or clearly named as drums - too ambiguous to guess "
+                  f"which track is percussion vs. e.g. bass/melodic, so they're skipped rather "
+                  f"than risk corrupting training data. Likely candidates: full-band '_songs/' "
+                  f"exports mixed into the library, or drum tracks with unhelpful names.")
+        if failure_reasons.get('all_pitches_unmapped', 0) > failed * 0.1:
+            print(f"    -> Most failures have drum-channel notes whose pitches aren't in "
+                  f"GM_DRUM_MAP (only covers standard GM pitches 35-62). If this library "
+                  f"uses an extended/custom articulation map, GM_DRUM_MAP needs more entries.")
+    if cfg.quality_filter:
+        print(f"  Quality filter: {files_affected} of {len(paths)} files had at least one "
+              f"section rejected ({files_all_rejected} entirely, "
+              f"{files_partially_rejected} partially).")
     # provenance metadata so train() can report original-vs-split-vs-augmented counts
     meta = {
         'original_files_found':   len(paths),
         'original_files_kept':    kept_files,
         'files_failed':           failed,
         'files_fully_rejected':   files_all_rejected,
+        'files_partially_rejected': files_partially_rejected,
         'sections_rejected':      rejected,
         'split_samples':          len(samples),   # section-samples after splitting+filtering
         'split_songs':            split_songs,
@@ -1786,7 +1886,9 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         else:
             print(f"  Section-samples:          {n_full} (song-splitting off)")
         if meta.get('sections_rejected', 0):
-            print(f"  Quality-filtered out:     {meta['sections_rejected']} flat/robotic sections")
+            files_affected = meta.get('files_fully_rejected', 0) + meta.get('files_partially_rejected', 0)
+            print(f"  Quality-filtered out:     {meta['sections_rejected']} flat/robotic sections "
+                  f"across {files_affected} files")
     else:
         print(f"  Section-samples:          {n_full} (no cache metadata - "
               f"synthetic or pre-metadata cache)")
@@ -2162,9 +2264,9 @@ def humanize_file(checkpoint, input_path, output_path,
     print(f"Mode: {mode}  |  velocity_bins={cfg.velocity_bins} "
           f"({vscale:.0f} MIDI-vel/bin)  vel_decode={vel_decode}  off_decode={off_decode}")
 
-    events = load_midi_events(input_path, cfg)
+    events, load_reason = load_midi_events(input_path, cfg)
     if not events:
-        print(f"ERROR: no drum events in {input_path}"); sys.exit(1)
+        print(f"ERROR: no drum events in {input_path} (reason: {load_reason})"); sys.exit(1)
     events.sort(key=lambda e: (e.bar, e.grid_step, e.instrument))
     print(f"Loaded {len(events)} events from {input_path}")
 
@@ -2498,13 +2600,13 @@ def main():
                    help='CACHE: keep flat/robotic sections (default: filter them out, '
                         'since a mechanical MIDI teaches the model nothing about feel).')
     p.add_argument('--min_velocity_std', type=float, default=None,
-                   help='CACHE: reject-if-flat velocity std threshold (MIDI vel units, default 4).')
+                   help='CACHE: reject-if-flat velocity std threshold (MIDI vel units, default 8).')
     p.add_argument('--min_velocity_range', type=float, default=None,
-                   help='CACHE: reject-if-flat velocity range threshold (default 12).')
+                   help='CACHE: reject-if-flat velocity range threshold (default 24).')
     p.add_argument('--min_offset_std', type=float, default=None,
-                   help='CACHE: reject-if-flat timing std threshold (ticks, default 2).')
+                   help='CACHE: reject-if-flat timing std threshold (ticks, default 4).')
     p.add_argument('--min_offset_range', type=float, default=None,
-                   help='CACHE: reject-if-flat timing range threshold (ticks, default 6).')
+                   help='CACHE: reject-if-flat timing range threshold (ticks, default 12).')
     p.add_argument('--bar_rotation', dest='bar_rotation', action='store_true',
                    default=None,
                    help='TRAIN: enable bar-rotation augmentation - drop the first bars so '

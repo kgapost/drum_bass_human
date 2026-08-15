@@ -98,9 +98,9 @@ pretty_midi's downbeat detection, and moves it into one of two new
 top-level folders under the library root — each file goes to AT MOST ONE
 destination, decided in this priority order:
 
-  1) "songs/"  — file's filename OR path contains "song" or "songs"
+  1) "_songs/" — file's filename OR path contains "song" or "songs"
                  (case-insensitive) AND it's longer than 64 measures.
-  2) "g48/"    — (checked only if #1 didn't match) file is longer than
+  2) "_g48/"   — (checked only if #1 didn't match) file is longer than
                  48 measures.
   3) otherwise — left where it is.
 
@@ -121,8 +121,8 @@ USAGE
 MOVE-G24  (separate mode, run with --move-g24)
 -------------------------------------------------
 Same idea as move-by-measures, but simpler: every .mid/.midi file NOT
-already under songs/ or g48/ that's longer than 24 bars moves into a new
-top-level g24/ folder, same path-folded-filename convention. Since
+already under _songs/ or _g48/ that's longer than 24 bars moves into a new
+top-level _g24/ folder, same path-folded-filename convention. Since
 move-by-measures already relocated everything over 48 bars, this only
 picks up files in the 25-48 bar range.
 
@@ -130,6 +130,102 @@ USAGE
 -----
   python parse_midi_library.py "/path/to/data" --move-g24 --preview 20
   python parse_midi_library.py "/path/to/data" --move-g24 --execute
+
+VERIFY-MIDI  (separate mode, run with --verify-midi)
+-------------------------------------------------------
+Scans every .mid/.midi file under the library and tries to actually load it
+with pretty_midi.PrettyMIDI(...) (the same class the training pipeline uses,
+e.g. drum_humanizer_v3.py's cache builder). Files that raise ANY exception
+while loading (corrupt tick counts, malformed headers, etc.) are considered
+faulty and deleted — this catches things like:
+
+  ValueError: MIDI file has a largest tick of 17587201, it is likely corrupt
+
+USAGE
+-----
+  python parse_midi_library.py "/path/to/data" --verify-midi --preview 20
+      # dry run, print 20 sampled faulty files + their errors, deletes nothing
+
+  python parse_midi_library.py "/path/to/data" --verify-midi
+      # dry run (default), scans everything and lists every faulty file
+
+  python parse_midi_library.py "/path/to/data" --verify-midi --execute
+      # actually deletes every file pretty_midi could not load
+
+ERASE-JUNK  (separate mode, run with --erase-junk)
+------------------------------------------------------
+Scans every .mid/.midi file that pretty_midi CAN load (files it can't are
+--verify-midi's job, not this mode's - they're skipped here, not deleted)
+and deletes ones that are too sparse or too short to ever be useful training
+material for drum_humanizer_v3.py's cache builder:
+
+  - "no_notes_at_all"       - zero notes in the whole file, any track/channel.
+  - "too_few_notes(<N)"     - fewer than N notes total (default N=10),
+                               counting ALL notes on ANY track/channel, before
+                               any drum-specific filtering.
+  - "too_few_drum_events(<N)" - fewer than N notes SURVIVE
+                               drum_humanizer_v3.py's own channel-selection
+                               (see select_drum_notes() below, mirroring that
+                               file's _get_drum_notes()) and GM_DRUM_MAP pitch
+                               filtering (default N=10, matching its
+                               'too_few_events' threshold exactly). This is
+                               NOT a subset of too_few_notes above - a file
+                               can have plenty of raw notes and still fail
+                               here, e.g. a kit using extended cymbal/
+                               articulation pitches outside GM_DRUM_MAP's
+                               standard 35-62 range, so most of its notes
+                               never reach the model. Skipped (not counted as
+                               junk under this reason) for files whose track
+                               selection is itself ambiguous or empty - see
+                               "too_few_notes"/--erase-ambiguous for those.
+  - "shorter_than_X_measure"- the file's duration (pretty_midi's end time) is
+                               less than X of one measure at its own tempo/
+                               time-signature (default X=0.5, i.e. under half
+                               a bar) - too short to contain a usable groove.
+
+A file can match more than one reason; it's only deleted once, but every
+matching reason is counted in the summary breakdown.
+
+USAGE
+-----
+  python parse_midi_library.py "/path/to/data" --erase-junk --preview 20
+      # dry run, print 20 sampled junk files + their reasons, deletes nothing
+
+  python parse_midi_library.py "/path/to/data" --erase-junk
+      # dry run (default), scans everything and lists every junk file
+
+  python parse_midi_library.py "/path/to/data" --erase-junk --execute
+      # actually deletes every file matching a junk reason
+
+  python parse_midi_library.py "/path/to/data" --erase-junk --min-notes 4 \\
+         --min-drum-events 4 --min-measure-fraction 0.25 --execute
+      # override the thresholds
+
+ERASE-AMBIGUOUS  (separate mode, run with --erase-ambiguous)
+------------------------------------------------------------
+Scans every .mid/.midi file that pretty_midi CAN load (files it can't are
+--verify-midi's job, not this mode's - they're skipped here, not deleted) and
+deletes ones that drum_humanizer_v3.py's cache builder can never use because
+it can't tell which track is the drums: multiple non-empty tracks, none
+flagged is_drum (channel 10), and none of them name-matched as drums (see
+that file's _get_drum_notes()) - counted there as the 'ambiguous_multi_track'
+failure reason. This mode mirrors that exact heuristic by hand (kept in sync
+manually - see select_drum_notes() below) so it deletes precisely the files
+the cache builder would otherwise silently skip on every future run. Unlike
+--erase-junk, this is NOT a subset check against a simpler count - a file
+can have plenty of notes and still be permanently unusable here, so nothing
+else already removes these.
+
+USAGE
+-----
+  python parse_midi_library.py "/path/to/data" --erase-ambiguous --preview 20
+      # dry run, print 20 sampled ambiguous files, deletes nothing
+
+  python parse_midi_library.py "/path/to/data" --erase-ambiguous
+      # dry run (default), scans everything and lists every ambiguous file
+
+  python parse_midi_library.py "/path/to/data" --erase-ambiguous --execute
+      # actually deletes every file matching ambiguous_multi_track
 """
 
 import argparse
@@ -637,11 +733,15 @@ def normalize_spacing(s):
 
 def extract_company(top_folder_name):
     """'210@GROOVE_MONKEE_BLUES' -> ('GROOVE', 'MONKEE_BLUES')
-    '14@EZX_METALHEADS' -> ('EZX', 'METALHEADS')"""
+    '14@EZX_METALHEADS' -> ('EZX', 'METALHEADS')
+    '02_@EZDRUMMER_3' -> ('02', 'EZDRUMMER_3')  (underscore-before-'@' variant)"""
     name = ENUM_PREFIX_RE.sub('', top_folder_name)
     parts = re.split(r'[_\-\s]+', name, maxsplit=1)
     company = parts[0].strip() if parts and parts[0].strip() else "MISC"
     remainder = parts[1].strip() if len(parts) > 1 else ""
+    remainder = remainder.lstrip('@').strip()  # e.g. "02_@EZDRUMMER_3" splits into
+                                                # ("02", "@EZDRUMMER_3") since ENUM_PREFIX_RE
+                                                # only strips a DIRECTLY-adjacent "NN@" prefix
     return company, remainder
 
 
@@ -817,7 +917,339 @@ def phase_flatten_filenames(base, dry_run, preview_count=None, seed=None):
         else:
             print(f"  WARNING: file count MISMATCH — {len(all_files)} before, {after_count} after. "
                   f"Investigate before trusting the result.")
+        # every file just moved OUT of its old deep folder tree into COMPANY/GENRE/,
+        # so the old numbered/"@" folder trees are now empty shells — clean them up.
+        phase_remove_empty_dirs(base, dry_run=False, label="Flatten cleanup")
     return renamed
+
+
+# -----------------------------------------------------------------------
+# VERIFY-MIDI  (separate mode — see module docstring for the rules)
+# -----------------------------------------------------------------------
+def midi_load_error(path):
+    """Try to load `path` with pretty_midi, the same way the training
+    pipeline's cache builder does. Returns None if it loads fine, or a
+    short string describing the error if it doesn't."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pretty_midi.PrettyMIDI(path)
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def phase_verify_midi(base, dry_run, preview_count=None, seed=None):
+    print("\n=== Verify MIDI: delete files pretty_midi cannot load ===")
+    if not HAS_PRETTY_MIDI:
+        print("  ERROR: pretty_midi is not installed — cannot verify files. "
+              "Install it with: pip install pretty_midi")
+        return 0
+
+    candidates = []
+    for root, _dirs, files in os.walk(base):
+        for fname in files:
+            if fname.lower().endswith((".mid", ".midi")):
+                candidates.append(os.path.join(root, fname))
+
+    print(f"  Scanning {len(candidates)} .mid/.midi files "
+          f"(this loads every file with pretty_midi, so it takes a while)...")
+
+    bad = []  # (path, error)
+    n_scanned = 0
+    for p in candidates:
+        n_scanned += 1
+        if n_scanned % 5000 == 0:
+            print(f"  ...scanned {n_scanned}/{len(candidates)}")
+        err = midi_load_error(p)
+        if err is not None:
+            bad.append((p, err))
+
+    print(f"  Scanned {n_scanned} files. Faulty (unparseable): {len(bad)}")
+
+    if preview_count:
+        rng = random.Random(seed)
+        sample = rng.sample(bad, min(preview_count, len(bad)))
+        print(f"  Preview of {len(sample)} sampled faulty files (nothing will be deleted):")
+        for p, err in sample:
+            rel = os.path.relpath(p, base)
+            print(f"    {rel}")
+            print(f"      -> {err}")
+        return 0
+
+    for p, err in bad:
+        rel = os.path.relpath(p, base)
+        print(f"  {'[DRY RUN] would delete' if dry_run else 'deleting'}: {rel}  ({err})")
+
+    if dry_run:
+        print(f"  [DRY RUN] would delete {len(bad)} faulty files. Re-run with --execute to apply, "
+              f"or use --preview N to sample results first.")
+        return 0
+
+    deleted = 0
+    for p, _err in bad:
+        try:
+            os.remove(p)
+            deleted += 1
+        except OSError as e:
+            print(f"  failed to delete {p}: {e}")
+    print(f"  Deleted {deleted} faulty files.")
+    return deleted
+
+
+# -----------------------------------------------------------------------
+# DRUM-TRACK SELECTION  (shared by --erase-junk's too_few_drum_events check
+# and --erase-ambiguous)
+# -----------------------------------------------------------------------
+# Mirrors drum_humanizer_v3.py's _get_drum_notes() track-selection heuristic
+# and its GM_DRUM_MAP pitch coverage, by hand. Keep these in sync with that
+# file if either one ever changes.
+_DRUM_NAME_RE = re.compile(r'drum|kit|perc|groove|beat', re.IGNORECASE)
+_NON_DRUM_NAME_RE = re.compile(
+    r'bass|guitar|piano|keys?|synth|vocal|lead|pad|string|brass|horn|organ|choir', re.IGNORECASE)
+
+# Standard GM drum pitches drum_humanizer_v3.py's GM_DRUM_MAP recognizes
+# (35-62 only - extended/custom articulation pitches outside this set are
+# invisible to it, same caveat as that file's own comment on GM_DRUM_MAP).
+GM_MAPPED_PITCHES = {35, 36, 38, 40, 37, 42, 44, 46, 41, 43, 45, 47, 48, 50,
+                      49, 57, 51, 59, 53, 52, 55, 56, 58, 60, 62, 39}
+
+
+def select_drum_notes(midi):
+    """Same branching as drum_humanizer_v3.py's _get_drum_notes(): returns
+    (notes, source) where source is 'channel10', 'single_track_fallback',
+    'name_match_fallback', 'ambiguous_multi_track', or 'no_notes'."""
+    drum_tracks = [t for t in midi.instruments if t.is_drum]
+    if drum_tracks:
+        return [n for t in drum_tracks for n in t.notes], 'channel10'
+    non_empty = [t for t in midi.instruments if t.notes]
+    if not non_empty:
+        return [], 'no_notes'
+    if len(non_empty) == 1:
+        return list(non_empty[0].notes), 'single_track_fallback'
+    named_drum = [t for t in non_empty
+                  if _DRUM_NAME_RE.search(t.name or '') and not _NON_DRUM_NAME_RE.search(t.name or '')]
+    if named_drum:
+        return [n for t in named_drum for n in t.notes], 'name_match_fallback'
+    return [], 'ambiguous_multi_track'
+
+
+# -----------------------------------------------------------------------
+# ERASE-JUNK  (separate mode — see module docstring for the rules)
+# -----------------------------------------------------------------------
+def measure_length_seconds(pm):
+    """Seconds per measure at this file's first tempo/time-signature (good
+    enough for a junk-length check; files with mid-song tempo/meter changes
+    are rare in a groove-loop library and this only needs to be roughly
+    right to catch genuinely tiny scraps)."""
+    tempo = 120.0
+    try:
+        tc = pm.get_tempo_changes()
+        if len(tc[1]) > 0:
+            tempo = float(tc[1][0])
+    except Exception:
+        pass
+    num, den = 4, 4
+    try:
+        if pm.time_signature_changes:
+            ts0 = sorted(pm.time_signature_changes, key=lambda t: t.time)[0]
+            num, den = ts0.numerator, ts0.denominator
+    except Exception:
+        pass
+    beats_per_bar = float(num) * (4.0 / float(den)) if den else 4.0
+    seconds_per_beat = 60.0 / max(1e-6, tempo)
+    return max(1e-6, beats_per_bar * seconds_per_beat)
+
+
+def analyze_junk(path, min_notes, min_drum_events, min_measure_fraction):
+    """Load `path` once and return a list of junk reason-strings (empty list
+    if it's fine). Returns None if pretty_midi can't load it at all - that's
+    --verify-midi's job, not this mode's, so such files are just skipped
+    here rather than counted as junk."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pm = pretty_midi.PrettyMIDI(path)
+    except Exception:
+        return None
+
+    reasons = []
+    total_notes = sum(len(inst.notes) for inst in pm.instruments)
+    if total_notes == 0:
+        reasons.append("no_notes_at_all")
+    elif total_notes < min_notes:
+        reasons.append(f"too_few_notes(<{min_notes})")
+
+    # Separate, stricter check: how many notes would actually survive
+    # drum_humanizer_v3.py's own channel-selection + GM_DRUM_MAP filtering
+    # (its 'too_few_events' failure reason) - NOT a subset of total_notes
+    # above, since a file can have plenty of raw notes but few (or none) on
+    # the selected track that map to a standard GM drum pitch. Skipped for
+    # 'ambiguous_multi_track' / 'no_notes' sources - those are --erase-
+    # ambiguous's and "no_notes_at_all"'s job respectively, not this reason's.
+    notes, source = select_drum_notes(pm)
+    if source not in ('ambiguous_multi_track', 'no_notes'):
+        mapped_count = sum(1 for n in notes if n.pitch in GM_MAPPED_PITCHES)
+        if mapped_count < min_drum_events:
+            reasons.append(f"too_few_drum_events(<{min_drum_events})")
+
+    mlen = measure_length_seconds(pm)
+    duration = pm.get_end_time()
+    if duration / mlen < min_measure_fraction:
+        reasons.append(f"shorter_than_{min_measure_fraction}_measure")
+
+    return reasons
+
+
+def phase_erase_junk_midi(base, dry_run, min_notes=10, min_drum_events=10, min_measure_fraction=0.5,
+                           preview_count=None, seed=None):
+    print(f"\n=== Erase junk MIDI: no notes / <{min_notes} notes / "
+          f"<{min_drum_events} drum-mapped events / <{min_measure_fraction} of a measure ===")
+    if not HAS_PRETTY_MIDI:
+        print("  ERROR: pretty_midi is not installed — cannot analyze files. "
+              "Install it with: pip install pretty_midi")
+        return 0
+
+    candidates = []
+    for root, _dirs, files in os.walk(base):
+        for fname in files:
+            if fname.lower().endswith((".mid", ".midi")):
+                candidates.append(os.path.join(root, fname))
+
+    print(f"  Scanning {len(candidates)} .mid/.midi files "
+          f"(this loads every file with pretty_midi, so it takes a while)...")
+
+    junk = []  # (path, reasons)
+    reason_counts = collections.Counter()
+    n_scanned = 0
+    n_unreadable = 0
+    for p in candidates:
+        n_scanned += 1
+        if n_scanned % 10000 == 0:
+            print(f"  ...scanned {n_scanned}/{len(candidates)}")
+        reasons = analyze_junk(p, min_notes, min_drum_events, min_measure_fraction)
+        if reasons is None:
+            n_unreadable += 1
+            continue
+        if reasons:
+            junk.append((p, reasons))
+            for r in reasons:
+                reason_counts[r] += 1
+
+    print(f"  Scanned {n_scanned} files ({n_unreadable} unreadable, skipped — "
+          f"see --verify-midi for those).")
+    print(f"  Junk files: {len(junk)}")
+    for reason, count in reason_counts.most_common():
+        print(f"    {count:>8}  {reason}")
+
+    if preview_count:
+        rng = random.Random(seed)
+        sample = rng.sample(junk, min(preview_count, len(junk)))
+        print(f"  Preview of {len(sample)} sampled junk files (nothing will be deleted):")
+        for p, reasons in sample:
+            rel = os.path.relpath(p, base)
+            print(f"    {rel}")
+            print(f"      -> {', '.join(reasons)}")
+        return 0
+
+    for p, reasons in junk:
+        rel = os.path.relpath(p, base)
+        print(f"  {'[DRY RUN] would delete' if dry_run else 'deleting'}: {rel}  ({', '.join(reasons)})")
+
+    if dry_run:
+        print(f"  [DRY RUN] would delete {len(junk)} junk files. Re-run with --execute to apply, "
+              f"or use --preview N to sample results first.")
+        return 0
+
+    deleted = 0
+    for p, _reasons in junk:
+        try:
+            os.remove(p)
+            deleted += 1
+        except OSError as e:
+            print(f"  failed to delete {p}: {e}")
+    print(f"  Deleted {deleted} junk files.")
+    return deleted
+
+
+# -----------------------------------------------------------------------
+# ERASE-AMBIGUOUS  (separate mode — see module docstring for the rules)
+# -----------------------------------------------------------------------
+def analyze_ambiguous(path):
+    """Load `path` once and return True if it's ambiguous_multi_track, False
+    otherwise. Returns None if pretty_midi can't load it at all - that's
+    --verify-midi's job, not this mode's, so such files are skipped here."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pm = pretty_midi.PrettyMIDI(path)
+    except Exception:
+        return None
+    _notes, source = select_drum_notes(pm)
+    return source == 'ambiguous_multi_track'
+
+
+def phase_erase_ambiguous_midi(base, dry_run, preview_count=None, seed=None):
+    print("\n=== Erase ambiguous MIDI: multi-track files with no identifiable drum part ===")
+    if not HAS_PRETTY_MIDI:
+        print("  ERROR: pretty_midi is not installed — cannot analyze files. "
+              "Install it with: pip install pretty_midi")
+        return 0
+
+    candidates = []
+    for root, _dirs, files in os.walk(base):
+        for fname in files:
+            if fname.lower().endswith((".mid", ".midi")):
+                candidates.append(os.path.join(root, fname))
+
+    print(f"  Scanning {len(candidates)} .mid/.midi files "
+          f"(this loads every file with pretty_midi, so it takes a while)...")
+
+    ambiguous = []
+    n_scanned = 0
+    n_unreadable = 0
+    for p in candidates:
+        n_scanned += 1
+        if n_scanned % 10000 == 0:
+            print(f"  ...scanned {n_scanned}/{len(candidates)}")
+        result = analyze_ambiguous(p)
+        if result is None:
+            n_unreadable += 1
+            continue
+        if result:
+            ambiguous.append(p)
+
+    print(f"  Scanned {n_scanned} files ({n_unreadable} unreadable, skipped — "
+          f"see --verify-midi for those).")
+    print(f"  Ambiguous (multi-track, no identifiable drum part): {len(ambiguous)}")
+
+    if preview_count:
+        rng = random.Random(seed)
+        sample = rng.sample(ambiguous, min(preview_count, len(ambiguous)))
+        print(f"  Preview of {len(sample)} sampled ambiguous files (nothing will be deleted):")
+        for p in sample:
+            rel = os.path.relpath(p, base)
+            print(f"    {rel}")
+        return 0
+
+    for p in ambiguous:
+        rel = os.path.relpath(p, base)
+        print(f"  {'[DRY RUN] would delete' if dry_run else 'deleting'}: {rel}")
+
+    if dry_run:
+        print(f"  [DRY RUN] would delete {len(ambiguous)} ambiguous files. Re-run with --execute to "
+              f"apply, or use --preview N to sample results first.")
+        return 0
+
+    deleted = 0
+    for p in ambiguous:
+        try:
+            os.remove(p)
+            deleted += 1
+        except OSError as e:
+            print(f"  failed to delete {p}: {e}")
+    print(f"  Deleted {deleted} ambiguous files.")
+    return deleted
 
 
 # -----------------------------------------------------------------------
@@ -849,15 +1281,15 @@ def build_path_folded_filename(base, path):
 
 
 def phase_move_by_measures(base, dry_run, preview_count=None, seed=None):
-    print("\n=== Move by measures: songs/ (>64 bars, 'song' in path) + g48/ (>48 bars) ===")
+    print("\n=== Move by measures: _songs/ (>64 bars, 'song' in path) + _g48/ (>48 bars) ===")
     if not HAS_PRETTY_MIDI:
         print("  ERROR: pretty_midi is not installed — cannot count measures. "
               "Install it with: pip install pretty_midi")
         return 0
 
-    songs_dir = os.path.join(base, "songs")
-    g48_dir = os.path.join(base, "g48")
-    skip_tops = {"songs", "g48"}
+    songs_dir = os.path.join(base, "_songs")
+    g48_dir = os.path.join(base, "_g48")
+    skip_tops = {"_songs", "_g48"}
 
     candidates = []
     for root, dirs, files in os.walk(base):
@@ -893,8 +1325,8 @@ def phase_move_by_measures(base, dry_run, preview_count=None, seed=None):
     n_songs = sum(1 for _p, d, _m in decisions if d == songs_dir)
     n_g48 = sum(1 for _p, d, _m in decisions if d == g48_dir)
     print(f"  Scanned {n_scanned} files ({n_failed} unreadable, skipped).")
-    print(f"  -> songs/ : {n_songs} files (>64 bars, 'song' in path)")
-    print(f"  -> g48/   : {n_g48} files (>48 bars)")
+    print(f"  -> _songs/ : {n_songs} files (>64 bars, 'song' in path)")
+    print(f"  -> _g48/   : {n_g48} files (>48 bars)")
 
     if preview_count:
         rng = random.Random(seed)
@@ -940,7 +1372,7 @@ def phase_move_by_measures(base, dry_run, preview_count=None, seed=None):
 
 def phase_move_above_measures(base, dry_run, threshold, dest_name, exclude_tops=(),
                                preview_count=None, seed=None):
-    """General single-criterion version of the songs/g48 mover above: move
+    """General single-criterion version of the _songs/_g48 mover above: move
     every .mid/.midi file longer than `threshold` bars into a new top-level
     `dest_name`/ folder, excluding files already under any of `exclude_tops`
     (and under `dest_name` itself, so reruns are safe). Same path-folded
@@ -1046,17 +1478,47 @@ def main():
                               "proposed renames without changing anything.")
     parser.add_argument("--seed", type=int, default=None,
                          help="Random seed for --preview sampling (reproducible previews).")
+    parser.add_argument("--verify-midi", action="store_true",
+                         help="Run ONLY a scan of every .mid/.midi file, loading it with "
+                              "pretty_midi and deleting any file it can't parse (e.g. corrupt "
+                              "tick counts), instead of the cleanup phases. Combine with "
+                              "--preview to sample faulty files first, or --execute to "
+                              "actually delete them.")
     parser.add_argument("--move-by-measures", action="store_true",
-                         help="Run ONLY the measures-based move (songs/ for >64-bar files with "
-                              "'song' in their path, g48/ for >48-bar files), instead of the "
+                         help="Run ONLY the measures-based move (_songs/ for >64-bar files with "
+                              "'song' in their path, _g48/ for >48-bar files), instead of the "
                               "cleanup phases. Combine with --preview to sample results first, "
                               "or --execute to actually move everything.")
     parser.add_argument("--move-g24", action="store_true",
                          help="Run ONLY a move of every .mid/.midi file (not already under "
-                              "songs/ or g48/) longer than 24 bars into a new top-level g24/ "
+                              "_songs/ or _g48/) longer than 24 bars into a new top-level _g24/ "
                               "folder, same path-folded-filename convention. Combine with "
                               "--preview to sample results first, or --execute to actually "
                               "move everything.")
+    parser.add_argument("--erase-junk", action="store_true",
+                         help="Run ONLY a scan-and-delete of files with no notes at all, fewer "
+                              "than --min-notes notes, fewer than --min-drum-events GM-mapped "
+                              "drum events, or shorter than --min-measure-fraction of a measure, "
+                              "instead of the cleanup phases. Combine with --preview to sample "
+                              "results first, or --execute to actually delete them.")
+    parser.add_argument("--min-notes", type=int, default=10, metavar="N",
+                         help="--erase-junk: delete files with fewer than N notes total "
+                              "(default: %(default)s).")
+    parser.add_argument("--min-drum-events", type=int, default=10, metavar="N",
+                         help="--erase-junk: delete files with fewer than N notes that survive "
+                              "drum_humanizer_v3.py's own channel-selection + GM_DRUM_MAP "
+                              "filtering (matches its 'too_few_events' threshold, default: "
+                              "%(default)s).")
+    parser.add_argument("--min-measure-fraction", type=float, default=0.5, metavar="X",
+                         help="--erase-junk: delete files shorter than X of one measure at "
+                              "their own tempo/time-signature (default: %(default)s, i.e. half "
+                              "a bar).")
+    parser.add_argument("--erase-ambiguous", action="store_true",
+                         help="Run ONLY a scan-and-delete of multi-track files where no track is "
+                              "flagged or named as drums (drum_humanizer_v3.py's cache builder "
+                              "would skip these as 'ambiguous_multi_track' every run anyway), "
+                              "instead of the cleanup phases. Combine with --preview to sample "
+                              "results first, or --execute to actually delete them.")
     args = parser.parse_args()
 
     base = os.path.abspath(args.base_dir)
@@ -1079,6 +1541,17 @@ def main():
                 print("\nDone.")
         return
 
+    if args.verify_midi:
+        if args.preview and not args.execute:
+            phase_verify_midi(base, dry_run=True, preview_count=args.preview, seed=args.seed)
+        else:
+            phase_verify_midi(base, dry_run=dry_run)
+            if dry_run:
+                print("\nDry run complete. Re-run with --execute to actually delete anything.")
+            else:
+                print("\nDone.")
+        return
+
     if args.move_by_measures:
         if args.preview and not args.execute:
             phase_move_by_measures(base, dry_run=True, preview_count=args.preview, seed=args.seed)
@@ -1091,15 +1564,42 @@ def main():
         return
 
     if args.move_g24:
-        exclude = ("songs", "g48")
+        exclude = ("_songs", "_g48")
         if args.preview and not args.execute:
-            phase_move_above_measures(base, dry_run=True, threshold=24, dest_name="g24",
+            phase_move_above_measures(base, dry_run=True, threshold=24, dest_name="_g24",
                                        exclude_tops=exclude, preview_count=args.preview, seed=args.seed)
         else:
-            phase_move_above_measures(base, dry_run=dry_run, threshold=24, dest_name="g24",
+            phase_move_above_measures(base, dry_run=dry_run, threshold=24, dest_name="_g24",
                                        exclude_tops=exclude)
             if dry_run:
                 print("\nDry run complete. Re-run with --execute to actually move anything.")
+            else:
+                print("\nDone.")
+        return
+
+    if args.erase_junk:
+        if args.preview and not args.execute:
+            phase_erase_junk_midi(base, dry_run=True, min_notes=args.min_notes,
+                                   min_drum_events=args.min_drum_events,
+                                   min_measure_fraction=args.min_measure_fraction,
+                                   preview_count=args.preview, seed=args.seed)
+        else:
+            phase_erase_junk_midi(base, dry_run=dry_run, min_notes=args.min_notes,
+                                   min_drum_events=args.min_drum_events,
+                                   min_measure_fraction=args.min_measure_fraction)
+            if dry_run:
+                print("\nDry run complete. Re-run with --execute to actually delete anything.")
+            else:
+                print("\nDone.")
+        return
+
+    if args.erase_ambiguous:
+        if args.preview and not args.execute:
+            phase_erase_ambiguous_midi(base, dry_run=True, preview_count=args.preview, seed=args.seed)
+        else:
+            phase_erase_ambiguous_midi(base, dry_run=dry_run)
+            if dry_run:
+                print("\nDry run complete. Re-run with --execute to actually delete anything.")
             else:
                 print("\nDone.")
         return

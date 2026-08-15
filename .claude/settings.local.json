@@ -30,7 +30,8 @@
       "Bash(python3 -m py_compile /home/kapost/drum_bass_human/parse_midi_library.py)",
       "Bash(python3 /home/kapost/drum_bass_human/parse_midi_library.py \"/media/kapost/Schemsis/Midi - Copy\" --execute)",
       "Bash(python3 /home/kapost/drum_bass_human/parse_midi_library.py \"/media/kapost/Schemsis/Midi - Copy\" --flatten --preview 20 --seed 42)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(python3 -m py_compile drum_humanizer_v3.py)"
     ]
   }
 }

@@ -1,43 +1,34 @@
-# drum_bass_human
+(# drum_bass_human
 
 Tools for humanizing drum MIDI (and syncing bass to it), finding similar
 grooves in a library, and auto-detecting theme/section boundaries in a song.
 
 ## Files
 
-- **config.py** - no code, just constants/defaults used by `drum_bass_studio.py`
-  (slider defaults, thresholds, etc). Nothing to run here.
-- **drum_humanizer_v3.py** - the core model. Learns human drum feel (timing +
-  velocity) from a MIDI library and applies it to stiff/quantized MIDI.
-  Has 3 modes: `cache`, `train`, `infer`.
-- **drum_theme_segmentation.py** - detects where a long song's theme/section
-  boundaries are (new pattern vs. repeat). Has 3 modes: `dataset`, `train`, `infer`.
+- **config.py** - constants/defaults used by `drum_bass_studio.py`
+- **drum_humanizer_v3.py** - Model that learns human drum feel (timing +
+  velocity) from a MIDI library and applies it to stiff MIDI.
+  (modes: `cache`, `train`, `infer`).
+- **drum_theme_segmentation.py** - detects section boundaries are (modes `dataset`, `train`, `infer`).
 - **find_similar_grooves.py** - given a query MIDI, ranks your library by how
-  similar it feels (rhythm/velocity/density/tempo). Has 2 modes: `index`, `query`.
+  similar it feels (rhythm/velocity/density/tempo). (modes: `index`, `query`).
 - **groove_finder_ui.py** - Tkinter desktop UI wrapper around
-  `find_similar_grooves.py`. Drag a MIDI in, see ranked matches, audition them.
+  `find_similar_grooves.py`.
   (Windows only - uses the built-in GS Wavetable synth for playback.)
-- **drum_bass_studio.py** - the main all-in-one app. Combines the humanizer +
-  segmentation model + bass sync into one window: drop a song's drum+bass MIDI,
-  segment it, humanize each segment, tweak rush/drag, sync bass, render.
+- **drum_bass_studio.py** - main all-in-one app. Combines the humanizer +
+  segmentation model + bass sync into one window
+  segment, humanize each segment, tweak rush/drag, sync bass, render.
 - **parse_midi_library.py** - standalone housekeeping tool for a large *external*
-  MIDI sample library (not part of the humanizer pipeline itself — it just
+  MIDI sample library (not part of the humanizer pipeline itself -
   tidies up a folder of purchased/downloaded MIDI packs). Prunes unwanted
   genres, dedupes exact-duplicate files, flattens the folder structure, and
-  sorts long files out by length. See section 6 below.
+  sorts long files out by length.
 
-## 1. Set up the environment (once)
-
+## 1. Set up environment
 ```bash
 python3 -m venv dbh
 source dbh/bin/activate
 pip install -r requirements.txt
-```
-
-Reactivate later with just:
-
-```bash
-source dbh/bin/activate
 ```
 
 Note: `tkinter` (needed by `groove_finder_ui.py` and `drum_bass_studio.py`) is
@@ -45,30 +36,25 @@ not in requirements.txt - it's not pip-installable, comes from the system.
 On Linux, if `import tkinter` fails: `sudo apt install python3-tk`.
 
 ## 2. drum_humanizer_v3.py - build cache -> train -> infer
-
 ```bash
-# a) build a training cache from a folder of MIDI files (once)
-python drum_humanizer_v3.py --mode cache --data_dir "/path/to/SD3/MIDI" \
-       --cache cache/samples.pkl
+# build a training cache from a folder of MIDI files (once)
+python drum_humanizer_v3.py --mode cache --data_dir "/path/to/SD3/MIDI" --cache cache/samples.pkl
 
-# b) train a model on that cache
-python drum_humanizer_v3.py --mode train --cache cache/samples.pkl \
-       --run_name sd3_v1 --epochs 100
+# train a model on that cache
+python drum_humanizer_v3.py --mode train --cache cache/samples.pkl --run_name sd3_v1 --epochs 100
 
 # quick smoke test with no real data:
 python drum_humanizer_v3.py --mode train --synthetic --epochs 3 --run_name smoke
 
-# c) humanize a loop with the trained checkpoint
-python drum_humanizer_v3.py --mode infer --checkpoint checkpoints/sd3_v1/best.pt \
-       --input my_loop.mid --output my_loop_human.mid --strength 0.85
+# humanize a loop with the trained checkpoint
+python drum_humanizer_v3.py --mode infer --checkpoint checkpoints/sd3_v1/best.pt --input my_loop.mid --output my_loop_human.mid --strength 0.85
 ```
 
 ## 3. drum_theme_segmentation.py - dataset -> train -> infer
 
 ```bash
 # a) build the (synthetic) training dataset from a MIDI library
-python drum_theme_segmentation.py --mode dataset --data_dir "/path/to/MIDI" \
-       --cache cache/segments.pkl --num_samples 300
+python drum_theme_segmentation.py --mode dataset --data_dir "/path/to/MIDI" --cache cache/segments.pkl --num_samples 300
 
 # b) train
 python drum_theme_segmentation.py --mode train --cache cache/segments.pkl \
@@ -174,7 +160,7 @@ cross-segment word dedup and a library of word abbreviations like
 get an incrementing `_2`, `_3`, ... suffix. Verifies the total file count is
 unchanged after `--execute`.
 
-### Mode 3: `--move-by-measures` - sort long files into songs/ and g48/
+### Mode 3: `--move-by-measures` - sort long files into _songs/ and _g48/
 
 ```bash
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-by-measures --preview 20
@@ -184,25 +170,25 @@ python parse_midi_library.py "/media/kapost/Schemsis/data" --move-by-measures --
 Counts every `.mid`/`.midi` file's length in bars (via `pretty_midi`'s
 downbeat detection) and moves it into one of two new top-level folders,
 first match wins:
-1. `songs/` - "song" or "songs" appears anywhere in the file's old path
+1. `_songs/` - "song" or "songs" appears anywhere in the file's old path
    (case-insensitive) AND it's longer than 64 bars.
-2. `g48/` - longer than 48 bars (checked only if #1 didn't match).
+2. `_g48/` - longer than 48 bars (checked only if #1 didn't match).
 
 The old path is folded into the new filename so nothing about where a file
 came from is lost once it's sitting in a flat folder.
 
-### Mode 4: `--move-g24` - sort remaining 25-48 bar files into g24/
+### Mode 4: `--move-g24` - sort remaining 25-48 bar files into _g24/
 
 ```bash
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-g24 --preview 20
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-g24 --execute
 ```
 
-Same idea, simpler: every `.mid`/`.midi` file **not already under `songs/` or
-`g48/`** that's longer than 24 bars moves into a new top-level `g24/` folder.
+Same idea, simpler: every `.mid`/`.midi` file **not already under `_songs/` or
+`_g48/`** that's longer than 24 bars moves into a new top-level `_g24/` folder.
 Since mode 3 already relocated everything over 48 bars, this only picks up
 the 25-48 bar range. Run mode 3 first if starting from scratch - mode 4
-explicitly excludes `songs/` and `g48/` from its scan either way.
+explicitly excludes `_songs/` and `_g48/` from its scan either way.
 
 **Suggested order on a fresh copy of the library:** mode 1 (cleanup) -> mode 2
 (flatten) -> mode 3 (move-by-measures) -> mode 4 (move-g24). Each mode

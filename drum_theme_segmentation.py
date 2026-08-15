@@ -4,7 +4,7 @@
  DRUM MIDI THEME TEMPORAL SEGMENTATION  (single-file: dataset + train + infer)
 ==============================================================================
 
-WHAT THIS PROGRAM DOES
+WHAT
 -----------------------
 Given a long drum MIDI file (e.g. a full song assembled from several distinct
 grooves/sections), predict WHERE the theme/section boundaries are - i.e. which
@@ -17,7 +17,7 @@ repeats, and - because *it* did the concatenating - knows exactly where every
 true boundary is. That is the (input, label) training pair. A model then
 learns to detect the same kind of boundary in a real, unlabeled file.
 
-KEY RULES (as specified)
+KEY RULES
 -------------------------
   • Eligible "theme" files: filename does NOT contain "song" (case-insensitive)
     AND the file is at most 10 measures long AND its very first note lands
@@ -72,6 +72,7 @@ import os
 import sys
 import re
 import glob
+import collections
 import json
 import time
 import pickle
@@ -118,7 +119,7 @@ def seed_everything(seed: int = GLOBAL_SEED, verbose: bool = True):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if verbose:
-        print(f"[seed] All RNGs seeded with {seed} (random, numpy, torch/cuda).")
+        print(f"[seed] {seed}")
 
 
 def _worker_init_fn(worker_id: int):
@@ -261,11 +262,42 @@ class NoteEvent:
     boundary:   int = 0   # TRAINING LABEL ONLY: 1 = this note starts a new theme
 
 
-def _load_midi_notes_impl(path: str, cfg: Config) -> Optional[List[NoteEvent]]:
+# DESIGN: mirrors drum_humanizer_v3.py's _get_drum_notes() track-selection
+# heuristic, duplicated here (not imported) to keep this file self-contained
+# per the GM_DRUM_MAP comment above. Purchased/downloaded drum-groove packs
+# routinely park their single track on whatever MIDI channel the exporting
+# DAW defaulted to (often not channel 10), so relying on pretty_midi's
+# is_drum flag alone silently treats the overwhelming majority of such a
+# library as unparseable. Keep in sync with drum_humanizer_v3.py by hand if
+# its heuristic ever changes.
+_DRUM_NAME_RE = re.compile(r'drum|kit|perc|groove|beat', re.IGNORECASE)
+_NON_DRUM_NAME_RE = re.compile(
+    r'bass|guitar|piano|keys?|synth|vocal|lead|pad|string|brass|horn|organ|choir', re.IGNORECASE)
+
+
+def _select_drum_notes(midi):
+    """Returns (notes, source) - source is 'channel10', 'single_track_fallback',
+    'name_match_fallback', 'ambiguous_multi_track', or 'no_notes'."""
+    drum_tracks = [t for t in midi.instruments if t.is_drum]
+    if drum_tracks:
+        return [n for t in drum_tracks for n in t.notes], 'channel10'
+    non_empty = [t for t in midi.instruments if t.notes]
+    if not non_empty:
+        return [], 'no_notes'
+    if len(non_empty) == 1:
+        return list(non_empty[0].notes), 'single_track_fallback'
+    named_drum = [t for t in non_empty
+                  if _DRUM_NAME_RE.search(t.name or '') and not _NON_DRUM_NAME_RE.search(t.name or '')]
+    if named_drum:
+        return [n for t in named_drum for n in t.notes], 'name_match_fallback'
+    return [], 'ambiguous_multi_track'
+
+
+def _load_midi_notes_impl(path: str, cfg: Config) -> Tuple[Optional[List[NoteEvent]], str]:
     midi = pretty_midi.PrettyMIDI(path)
-    notes = [n for t in midi.instruments if t.is_drum for n in t.notes]
+    notes, source = _select_drum_notes(midi)
     if not notes:
-        return None
+        return None, source
     notes.sort(key=lambda n: n.start)
     bar_ticks = cfg.ticks_per_beat * cfg.beats_per_bar
     events: List[NoteEvent] = []
@@ -284,19 +316,27 @@ def _load_midi_notes_impl(path: str, cfg: Config) -> Optional[List[NoteEvent]]:
         step = (grid_tick % bar_ticks) // cfg.ticks_per_grid
         events.append(NoteEvent(instrument=inst, bar=int(bar), grid_step=int(step),
                                 velocity=int(n.velocity), raw_tick=tick, raw_pitch=int(n.pitch)))
-    return events or None
+    if not events:
+        # every selected note existed but none mapped to a known GM pitch -
+        # distinct from "no drum notes at all" so an incomplete GM_DRUM_MAP is diagnosable.
+        return None, 'all_pitches_unmapped'
+    return events, source
 
 
-def load_midi_notes(path: str, cfg: Config) -> Optional[List[NoteEvent]]:
-    """Load a MIDI file's drum notes onto the fixed grid. Returns None (and
-    reports why) on any parse failure - callers treat None as 'skip this file'."""
+def load_midi_notes(path: str, cfg: Config) -> Tuple[Optional[List[NoteEvent]], str]:
+    """Load a MIDI file's drum notes onto the fixed grid. Returns (events, source)
+    - events is None (and source explains why) on any parse failure or when no
+    usable drum notes could be identified; callers treat events is None as
+    'skip this file'. source is one of 'channel10', 'single_track_fallback',
+    'name_match_fallback', 'ambiguous_multi_track', 'no_notes',
+    'all_pitches_unmapped', or 'exception:<ExceptionType>'."""
     if not HAS_PRETTY_MIDI:
         raise ImportError("pretty_midi required for MIDI I/O")
     try:
         return _load_midi_notes_impl(path, cfg)
     except Exception as exc:
         _report_error(f"parsing MIDI file '{os.path.basename(path)}'", exc)
-        return None
+        return None, f'exception:{type(exc).__name__}'
 
 
 def measure_count(events: List[NoteEvent]) -> int:
@@ -332,7 +372,33 @@ def _too_similar(a: str, b: str, ratio: float) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= ratio
 
 
-def scan_theme_files(data_dir: str, cfg: Config) -> Tuple[Dict[str, List[Tuple[str, List[NoteEvent]]]], Dict]:
+def _scan_one_file(args: Tuple[str, Config]) -> Tuple[str, str, Optional[List[NoteEvent]], Optional[str]]:
+    """Worker for scan_theme_files' ProcessPoolExecutor: load + apply every
+    eligibility filter except the (cheap, main-process-side) filename check.
+    Returns (path, reason, events, note_source):
+      - reason == 'kept': events is the note list, note_source is how the
+        drum track was identified (see _select_drum_notes).
+      - otherwise: events and note_source are None, and reason is either a
+        load_midi_notes() source explaining why no notes were found at all
+        (e.g. 'ambiguous_multi_track', 'all_pitches_unmapped',
+        'exception:ValueError'), or one of this function's own later-stage
+        eligibility exclusions ('too_few_notes', 'too_long', 'no_downbeat')."""
+    path, cfg = args
+    events, source = load_midi_notes(path, cfg)
+    if events is None:
+        return path, source, None, None
+    if len(events) < cfg.min_notes_per_theme:
+        return path, 'too_few_notes', None, None
+    events.sort(key=lambda e: (e.bar, e.grid_step, e.instrument))
+    if measure_count(events) > cfg.max_theme_measures:
+        return path, 'too_long', None, None
+    if events[0].bar != 0 or events[0].grid_step != 0:
+        return path, 'no_downbeat', None, None
+    return path, 'kept', events, source
+
+
+def scan_theme_files(data_dir: str, cfg: Config,
+                     num_workers: int = 4) -> Tuple[Dict[str, List[Tuple[str, List[NoteEvent]]]], Dict]:
     """
     Scan data_dir for eligible "theme" MIDI files and group them into families.
     A file is eligible only if ALL of:
@@ -343,51 +409,70 @@ def scan_theme_files(data_dir: str, cfg: Config) -> Tuple[Dict[str, List[Tuple[s
         downbeat start - see the module DESIGN note for why this is required)
     Returns (families, stats) where families maps a normalized name -> list of
     (path, events) tuples, and stats reports how many files were excluded and why.
+
+    DESIGN: parses files in a ProcessPoolExecutor with a tqdm progress bar -
+    same pattern as drum_humanizer_v3.py's build_cache() - since a full
+    library (pretty_midi-loading every .mid file one at a time on a single
+    core) can take tens of minutes with the old sequential loop giving no
+    output at all until it finished, which looked indistinguishable from a
+    hang. The cheap filename-substring check runs first, sequentially, so
+    excluded-by-name files never cost a worker round-trip.
     """
     paths = []
     for ext in ('mid', 'midi', 'MID', 'MIDI'):
         paths.extend(glob.glob(os.path.join(data_dir, '**', f'*.{ext}'), recursive=True))
     paths = sorted(set(paths))
+    print(f"Found {len(paths)} MIDI files in {data_dir}")
 
-    stats = {'found': len(paths), 'excluded_name': 0, 'excluded_parse': 0,
-             'excluded_too_few_notes': 0, 'excluded_too_long': 0,
-             'excluded_no_downbeat': 0, 'kept': 0}
-    families: Dict[str, List[Tuple[str, List[NoteEvent]]]] = {}
     excl = cfg.exclude_substring.lower()
-
+    excluded_name = 0
+    candidates = []
     for p in paths:
         base = os.path.basename(p)
         if excl and excl in base.lower():
-            stats['excluded_name'] += 1
+            excluded_name += 1
             continue
-        events = load_midi_notes(p, cfg)
-        if events is None:
-            stats['excluded_parse'] += 1
-            continue
-        if len(events) < cfg.min_notes_per_theme:
-            stats['excluded_too_few_notes'] += 1
-            continue
-        events.sort(key=lambda e: (e.bar, e.grid_step, e.instrument))
-        nmeasures = measure_count(events)
-        if nmeasures > cfg.max_theme_measures:
-            stats['excluded_too_long'] += 1
-            continue
-        if events[0].bar != 0 or events[0].grid_step != 0:
-            stats['excluded_no_downbeat'] += 1
-            continue
-        stats['kept'] += 1
-        fam = normalize_basename(p)
-        families.setdefault(fam, []).append((p, events))
+        candidates.append(p)
+
+    families: Dict[str, List[Tuple[str, List[NoteEvent]]]] = {}
+    kept = 0
+    exclusion_reasons = collections.Counter()
+    note_sources = collections.Counter()
+    work = [(p, cfg) for p in candidates]
+    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+        futures = [ex.submit(_scan_one_file, w) for w in work]
+        it = as_completed(futures)
+        if HAS_TQDM:
+            it = tqdm.tqdm(it, total=len(futures), desc="Scanning themes")
+        for fut in it:
+            path, reason, events, source = fut.result()
+            if reason == 'kept':
+                kept += 1
+                note_sources[source] += 1
+                fam = normalize_basename(path)
+                families.setdefault(fam, []).append((path, events))
+            else:
+                exclusion_reasons[reason] += 1
+
+    total_excluded = len(candidates) - kept
+    stats = {'found': len(paths), 'excluded_name': excluded_name, 'kept': kept,
+             'exclusion_reasons': dict(exclusion_reasons), 'note_sources': dict(note_sources)}
 
     print(f"── Theme scan ─────────────────────────────────────────")
     print(f"  Files found:                  {stats['found']}")
-    print(f"  Excluded (filename match):    {stats['excluded_name']} "
+    print(f"  Excluded (filename match):    {excluded_name} "
           f"(contains '{cfg.exclude_substring}')")
-    print(f"  Excluded (parse failed):      {stats['excluded_parse']}")
-    print(f"  Excluded (too few notes):     {stats['excluded_too_few_notes']}")
-    print(f"  Excluded (> {cfg.max_theme_measures} measures):        {stats['excluded_too_long']}")
-    print(f"  Excluded (no downbeat start): {stats['excluded_no_downbeat']}")
-    print(f"  Eligible theme files:         {stats['kept']}  "
+    print(f"  Excluded (other reasons):     {total_excluded}")
+    for reason, count in exclusion_reasons.most_common():
+        pct = 100.0 * count / total_excluded if total_excluded else 0.0
+        print(f"    {count:>8}  ({pct:5.1f}%)  {reason}")
+    fallback = note_sources.get('single_track_fallback', 0) + note_sources.get('name_match_fallback', 0)
+    if fallback:
+        print(f"  Recovered via non-channel-10 fallback: {fallback} files "
+              f"({note_sources.get('single_track_fallback', 0)} single-track, "
+              f"{note_sources.get('name_match_fallback', 0)} name-matched) "
+              f"- see _select_drum_notes for the heuristic.")
+    print(f"  Eligible theme files:         {kept}  "
           f"(grouped into {len(families)} name-families)")
     print(f"──────────────────────────────────────────────────────\n")
     return families, stats
@@ -504,8 +589,8 @@ def build_training_samples(families: Dict, cfg: Config, num_samples: int,
     return samples
 
 
-def build_cache(data_dir: str, cache_path: str, cfg: Config, num_samples: int):
-    families, stats = scan_theme_files(data_dir, cfg)
+def build_cache(data_dir: str, cache_path: str, cfg: Config, num_samples: int, num_workers: int = 4):
+    families, stats = scan_theme_files(data_dir, cfg, num_workers=num_workers)
     if len(families) < 2:
         print(f"ERROR: only {len(families)} usable theme family(ies) found in "
               f"'{data_dir}'. Need at least 2 distinct, dissimilarly-named themes.")
@@ -910,9 +995,9 @@ def compute_segment_boundaries(model, cfg: Config, input_path: str, threshold: f
     pretty_midi.PrettyMIDI object, for tempo-aware conversions downstream).
     """
     device = next(model.parameters()).device
-    events = load_midi_notes(input_path, cfg)
+    events, source = load_midi_notes(input_path, cfg)
     if not events:
-        raise ValueError(f"No drum events found in {input_path}")
+        raise ValueError(f"No drum events found in {input_path} (reason: {source})")
     events.sort(key=lambda e: (e.bar, e.grid_step, e.instrument))
 
     arr = events_to_arrays(events, cfg)
@@ -1053,7 +1138,10 @@ def main():
                         'but recall is very low (model too conservative); lower if the '
                         'reverse. The dataset-build step prints the true imbalance ratio '
                         'as a reference.')
-    p.add_argument('--num_workers', type=int, default=None)
+    p.add_argument('--num_workers', type=int, default=None,
+                   help='DATASET: parallel worker processes for scanning/parsing the MIDI '
+                        'library (default 2 - raise this for a large library, e.g. 8). '
+                        'TRAIN: also reused as the DataLoader worker count.')
     p.add_argument('--resume', default=None)
 
     # infer mode
@@ -1090,7 +1178,7 @@ def main():
     cfg = apply_overrides(cfg)
 
     if args.mode == 'dataset':
-        build_cache(args.data_dir, args.cache, cfg, args.num_samples)
+        build_cache(args.data_dir, args.cache, cfg, args.num_samples, num_workers=max(1, cfg.num_workers))
 
     elif args.mode == 'train':
         if not os.path.exists(args.cache):
