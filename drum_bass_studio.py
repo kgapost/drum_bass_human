@@ -86,6 +86,12 @@ except ImportError:
     HAS_HUMANIZER = False
 
 try:
+    from download_pretrained import ensure_pretrained_model
+    HAS_PRETRAINED_DOWNLOADER = True
+except ImportError:
+    HAS_PRETRAINED_DOWNLOADER = False
+
+try:
     import drum_theme_segmentation as dts
     HAS_SEGMENTATION = True
 except ImportError:
@@ -517,9 +523,20 @@ class StudioApp:
     def _load_default_pretrained(self):
         """Auto-select the bundled pretrained/humanizer_best.pt, if present, so the
         app is usable without a manual 'Load...' click. Still fully overridable -
-        this only sets the same state a manual Load does."""
+        this only sets the same state a manual Load does.
+
+        DESIGN: pretrained/ is gitignored (see README), so a fresh clone/machine has
+        no model at all yet - try fetching it from the shared Drive folder first.
+        This runs before mainloop() starts, so it's a one-time blocking delay only
+        when the model is genuinely missing; every later launch finds it locally and
+        skips the network check entirely. Best-effort either way: a failed/skipped
+        download just leaves the label at "(none loaded)", same as on a checkout
+        with no pretrained/ folder at all - the user can still Load... manually.
+        """
         if not HAS_HUMANIZER:
             return
+        if HAS_PRETRAINED_DOWNLOADER:
+            ensure_pretrained_model()
         path = dhu.DEFAULT_PRETRAINED_CHECKPOINT
         if os.path.exists(path):
             self.hum_checkpoint_path = path

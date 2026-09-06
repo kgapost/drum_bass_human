@@ -99,6 +99,53 @@ python drum_humanizer_v3.py --mode train --synthetic --epochs 3 --run_name smoke
 python drum_humanizer_v3.py --mode infer --checkpoint checkpoints/v1/best.pt --input my_loop.mid --output my_loop_human.mid --strength 0.85
 ```
 
+### Pretrained model (skip training to just try it)
+
+`--mode grid_search` and `drum_bass_studio.py` both know about a `pretrained/`
+folder holding the current best humanizer checkpoint, so trying the tool
+doesn't require training one yourself first:
+
+- `pretrained/humanizer_best.pt` - the winning run's weights + architecture
+  config only (no optimizer/scheduler state - it's inference-only, not
+  resumable for further training). `pretrained/humanizer_metadata.json`
+  records which run it came from, its val_loss, and the data/recipe
+  fingerprint it's comparable against.
+- `--mode grid_search` copies its winning run here automatically every time
+  it finishes, overwriting whatever was there before.
+- `--mode infer` and `drum_bass_studio.py` both default to
+  `pretrained/humanizer_best.pt` automatically whenever `--checkpoint` /
+  "Load..." isn't given explicitly.
+
+**This folder is intentionally NOT committed to git** - a ~250MB checkpoint
+doesn't belong in git history (see `knowledge.md`). Instead it's shared via a
+Google Drive folder, and `download_pretrained.py` fetches it automatically:
+
+```bash
+python download_pretrained.py             # fetch only if missing locally
+python download_pretrained.py --force     # re-fetch even if already present
+```
+
+- `drum_bass_studio.py` calls this automatically at startup: if
+  `pretrained/humanizer_best.pt` isn't there yet (e.g. right after cloning
+  this repo on a new machine), it fetches it from Drive before the window
+  opens. Every later launch finds the file already there and skips the
+  network check entirely - this is a one-time bootstrap cost, not a
+  per-launch delay.
+- Needs the `gdown` package (already in `requirements.txt`) - a plain
+  `requests.get()` on a Drive file URL chokes on Google's
+  virus-scan-warning interstitial for a file this size; `gdown` handles it.
+- Shared folder: https://drive.google.com/drive/folders/1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye
+  - Matched by **filename** inside the folder, not a hardcoded file id, so
+    replacing it there with a better model is picked up automatically with
+    no code change.
+  - This folder needs a real Google account to write to (Drive's "anyone
+    with the link can edit" is a UI/ACL permission, not an anonymous-upload
+    API) - uploading a new model there is a manual step, not automated by
+    anything in this repo.
+- If `gdown` isn't installed, Drive is unreachable, or nothing's been
+  uploaded there yet: both `--mode infer` and the UI fall back cleanly to
+  "no pretrained model" and just need an explicit `--checkpoint` / manual
+  "Load..." instead - this is a convenience, not a hard dependency.
 
 
 ## 4. find_similar_grooves.py - index -> query
@@ -125,7 +172,9 @@ python drum_bass_studio.py
 ```
 
 Both just open a window - drag/drop or Browse for the MIDI file(s), no other
-args needed.
+args needed. Studio's humanizer model doesn't need a manual "Load..." either -
+it auto-fetches and auto-selects the bundled pretrained model on first launch
+(see "Pretrained model" under section 3 above).
 
 ## 6. parse_midi_library.py - external MIDI library housekeeping
 

@@ -6,3 +6,4 @@ torch
 tqdm
 tkinterdnd2
 tensorboard
+gdown
