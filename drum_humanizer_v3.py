@@ -52,7 +52,7 @@ HOW IT IS USED - THREE MODES
  COMMAND-LINE ARGUMENTS
 ==============================================================================
 GLOBAL
-  --mode {cache,train,infer}   which stage to run (required)
+  --mode {cache,train,infer,grid_search}   which stage to run (required)
   --run_name NAME              checkpoint/log subfolder under checkpoints/
 
 CACHE MODE (build training data from MIDI)
@@ -84,6 +84,15 @@ TRAIN MODE
   --bar_rotation_prob X        chance of rotating a given sample (default 0.5)
   --num_workers N              dataloader workers
   --resume PATH                resume from a checkpoint
+
+GRID_SEARCH MODE (takes the TRAIN MODE args as its baseline, then sweeps 3 axes)
+  The leaderboard is printed AND written to checkpoints/grid_results.json, so it
+  survives the terminal - it holds every ranked run (val_loss, the winning combo,
+  each best.pt path), the runs that were NOT comparable and why, and the final
+  full-data retrain. Written once before the auto final train and again after it,
+  so an OOM in that last long pass can't cost you the ranking. Read it with e.g.
+    jq '.leaderboard[:5]' checkpoints/grid_results.json
+  Per-epoch curves live in checkpoints/<run>/log.jsonl; TensorBoard: --logdir checkpoints
 
 INFER MODE
   --checkpoint PATH            trained model (best.pt); architecture read from it
@@ -164,8 +173,11 @@ import json
 import time
 import pickle
 import random
+import shutil
 import argparse
+import warnings
 import traceback
+import multiprocessing
 from collections import Counter
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional
@@ -192,6 +204,12 @@ except ImportError:
     HAS_PRETTY_MIDI = False
     print("Warning: pretty_midi not installed - real MIDI I/O disabled. "
           "Install with: pip install pretty_midi")
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
 
 try:
     import tqdm
@@ -293,11 +311,11 @@ def _report_error(context: str, exc: BaseException, fatal: bool = False):
 # Params grow roughly linearly in layers and quadratically in d_model.
 MODEL_PRESETS = {
     # name       d_model  nhead  num_layers  dim_ff  dropout   (~params @128 vel-bins)
-    "tiny":   dict(d_model=128, nhead=4,  num_layers=3,  dim_feedforward=512,  dropout=0.10),   # ~0.9M
     "small":  dict(d_model=192, nhead=6,  num_layers=4,  dim_feedforward=768,  dropout=0.10),   # ~2.3M
     "base":   dict(d_model=256, nhead=8,  num_layers=6,  dim_feedforward=1024, dropout=0.10),   # ~5.4M (default)
     "deep":   dict(d_model=320, nhead=8,  num_layers=10, dim_feedforward=1280, dropout=0.15),   # ~13M
     "deeper": dict(d_model=384, nhead=8,  num_layers=14, dim_feedforward=1536, dropout=0.20),   # ~26M
+    "very_deep": dict(d_model=384, nhead=8, num_layers=20, dim_feedforward=1536, dropout=0.25),  # ~37M
     "huge":   dict(d_model=512, nhead=8,  num_layers=18, dim_feedforward=2048, dropout=0.20),   # ~59M
 }
 DEFAULT_PRESET = "base"
@@ -417,7 +435,15 @@ class Config:
     num_layers:       int = 6       # DESIGN: encoder-only, single stack
     dim_feedforward:  int = 1024
     dropout:          float = 0.1
-    max_seq_len:      int = 1024    # max hits per sample
+    # DESIGN: EVERY sample is padded to this length, so it is a compute knob, not just a
+    # ceiling - and attention is O(n^2), so an oversized value is brutally expensive.
+    # Measured on a real 166k-sample library: median sample is 38 notes, p95 is 176, and
+    # only 0.10% exceed 1024. At the old 1024 default that made 93.9% of every batch pure
+    # padding - 16x wasted work in the linear layers and 123x in attention. 256 covers
+    # 98.5% of samples uncropped; the rest are randomly cropped in training and chunked
+    # with overlap at inference, so this is a speed win, not a quality loss. Raise it only
+    # if your library is genuinely long-form (the cache build prints the note counts).
+    max_seq_len:      int = 256     # max hits per sample (see DESIGN above before raising)
 
     # ── Training ───────────────────────────────────────────────────────────────
     batch_size:       int = 32
@@ -431,7 +457,8 @@ class Config:
     off_loss_weight:  float = 2.0   # DESIGN: timing is harder -> more gradient
     val_split:        float = 0.05
     num_workers:      int = 4
-    early_stop_patience: int = 15
+    early_stop_patience: int = 20
+    print_every:      int = 15      # batch-progress print interval (in-place, see train())
 
     # ── Derived ────────────────────────────────────────────────────────────────
     ticks_per_grid:     int = field(init=False)
@@ -1101,9 +1128,13 @@ def _process_one_file(args) -> Optional[Dict]:
                 if not q['keep']:
                     rejected += 1
                     continue
+            # song_id: every section cut from THIS file carries the same id, so the
+            # train/val split can keep a song whole (see _split_by_song). All sections
+            # here share one `path` string object, so pickle memoises it - the id costs
+            # one copy per file, not per section.
             out.append({'target': tok.events_to_arrays(seg),
                         'input':  tok.events_to_arrays(tok.quantize_events(seg)),
-                        'length': len(seg), 'events': seg})
+                        'length': len(seg), 'events': seg, 'song_id': path})
         # attach a small stats marker on the first sample so the builder can tally
         if out:
             out[0]['_rejected_sections'] = rejected
@@ -1122,11 +1153,16 @@ def _process_one_file(args) -> Optional[Dict]:
 
 def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 8,
                 split_songs: bool = True, section_bars: int = 16, hop_bars: int = 8):
+    # DESIGN: glob.glob's recursive walk over a deep/large directory (a real library is
+    # 190k+ files) is a single blocking call with no progress output - print before it
+    # starts so a slow filesystem/network drive doesn't read as a hang before any output.
+    print(f"Scanning {data_dir} for MIDI files...", flush=True)
+    t_scan = time.time()
     paths = []
     for ext in ('mid', 'midi', 'MID', 'MIDI'):
         paths.extend(glob.glob(os.path.join(data_dir, '**', f'*.{ext}'), recursive=True))
     paths = sorted(set(paths))
-    print(f"Found {len(paths)} MIDI files in {data_dir}")
+    print(f"Found {len(paths)} MIDI files in {data_dir} ({time.time() - t_scan:.1f}s)")
     if split_songs:
         print(f"Song-splitting ON: long files -> {section_bars}-bar sections, hop {hop_bars}.")
     if cfg.quality_filter:
@@ -1217,6 +1253,13 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
 # DATASET
 # =============================================================================
 
+# Fixed seed for the validation set's de-humanization draw. Deliberately independent
+# of GLOBAL_SEED: the val inputs should stay byte-identical across runs even when the
+# training seed is changed to re-roll an experiment, or val loss stops being comparable
+# between those runs. Changing this value re-rolls the whole val set - don't.
+_VAL_DEHUM_SEED = 20240917
+
+
 class DrumDataset(Dataset):
     def __init__(self, samples: List[Dict], cfg: Config, augment: bool = True):
         self.samples = samples
@@ -1232,8 +1275,13 @@ class DrumDataset(Dataset):
     def _rotate_bars(self, inp, tgt):
         """
         Drop the first K bars so the phrase starts later, then re-base positions to
-        start at bar 0. K scales with groove length so longer phrases rotate more:
-            ≥16 bars -> drop 8   |   ≥8 bars -> drop 4   |   ≥4 bars -> drop 2   |  else none
+        start at bar 0. K is drawn uniformly from 1..cap, where the cap scales with
+        groove length so longer phrases can rotate further:
+            ≥16 bars -> cap 8   |   ≥8 bars -> cap 4   |   ≥4 bars -> cap 2   |  else none
+        DESIGN: K used to be FIXED at the cap, which gave every groove exactly two
+        possible phrase starts for the whole run (rotated or not) - thin variety for
+        something applied to 60% of samples. Randomizing K costs nothing and is just
+        as safe: the invariance below holds for ANY whole-bar K, not just the cap.
         Applied identically to input and target. SAFE: the result is a real performance
         starting later; only 'positions' needs shifting - metric/IOI/velocity/offset are
         invariant to whole-bar rotation. Returns (inp, tgt) unchanged if too short.
@@ -1244,15 +1292,16 @@ class DrumDataset(Dataset):
             return inp, tgt
         max_bar = int(inp['positions'].max()) // spb      # zero-based -> total bars = max_bar+1
         total_bars = max_bar + 1
-        # pick the largest rotation the length qualifies for
+        # cap the rotation by length, then pick anywhere up to it
         if total_bars >= 16:
-            k = 8
+            k_cap = 8
         elif total_bars >= 8:
-            k = 4
+            k_cap = 4
         elif total_bars >= 4:
-            k = 2
+            k_cap = 2
         else:
             return inp, tgt                   # too short to rotate
+        k = random.randint(1, k_cap)
         cut = k * spb                         # grid positions before this are dropped
         keep = inp['positions'] >= cut        # boolean mask of notes to keep
         if keep.sum() < 8:                    # don't rotate into an almost-empty tail
@@ -1276,9 +1325,84 @@ class DrumDataset(Dataset):
             out[k] = np.concatenate([v, np.full(pad, fill, dtype=v.dtype)])
         return out
 
-    def _augment_input(self, inp):
+    # Lattice sizes (in MIDI velocity units) the 'lattice' de-humanization draws from.
+    # 16 is what Tokenizer.quantize_events hardcodes; the rest coarsen from there.
+    # DESIGN: deliberately no step below 16. A finer lattice is finer than the cached
+    # de-humanization it replaces, so it hands the velocity head its own label back
+    # (measured contour corr(input, target) = 0.97 at step 8 vs 0.89 at 16) while
+    # representing no input a human would ever program - real programming repeats a
+    # few chosen levels per kit piece, which is what the 'palette' style below does.
+    _COARSE_STEPS = (16, 24, 32, 48)
+
+    def _dehumanize_velocities(self, human_vel, instruments, rng=random):
+        """
+        Build the INPUT's velocity contour from the human take - the same job
+        Tokenizer.quantize_events does at cache-build time, but with the strength AND
+        style drawn fresh for every sample.
+
+        WHY: the cached input is ONE fixed function of the target (round to a 16-MIDI
+        lattice, then mean-correct), so |input_vel - target_vel| <= 8 on essentially
+        every note. The velocity head can ride that: at training time the answer is
+        most of the way written on its own input. Real programmed MIDI - a handful of
+        flat levels per kit piece, chosen from intent rather than from a performance -
+        carries no such hint, so whatever the model learned from it evaporates at
+        inference. Redrawing the de-humanization each epoch removes the fixed lattice
+        to key on. Nothing here touches the target, so no label is ever changed.
+
+        Two styles, 50/50:
+          'lattice' - the original round-to-N-MIDI, N random over _COARSE_STEPS.
+          'palette' - how drums are actually programmed: each kit piece gets 1-3
+                      velocity levels for the whole groove and every hit on that piece
+                      snaps to the nearest one.
+        Both are AVERAGE-PRESERVING, for the same reason quantize_events is: intensity
+        is read off the input's mean further down, so letting it drift would corrupt
+        the conditioning signal the user steers with at inference.
+
+        rng: any random.Random-compatible source. Defaults to the global `random`
+        (training); the validation path passes a per-sample seeded one so its draw is
+        fixed forever - see __getitem__.
+
+        human_vel: the take's velocities in MIDI units (not bins). Returns the same.
+        """
+        v = human_vel.astype(np.float64)
+        if len(v) == 0:
+            return v
+        if rng.random() < 0.5:
+            step = rng.choice(self._COARSE_STEPS)
+            out = np.round(v / step) * step
+        else:
+            out = v.copy()
+            for inst in np.unique(instruments):
+                m = instruments == inst
+                vi = v[m]
+                k = 1 if len(vi) < 3 else rng.randint(1, 3)
+                if k == 1:
+                    out[m] = vi.mean()          # one flat level for this kit piece
+                else:
+                    # k levels spaced through THIS piece's own dynamic range (quantile
+                    # centres), each hit snapped to the nearest - a programmer picks a
+                    # couple of levels per piece and still puts accents where accents
+                    # belong, so some ordering survives, just far coarser than +-8.
+                    levels = np.quantile(vi, (np.arange(k) + 0.5) / k)
+                    out[m] = levels[np.abs(vi[:, None] - levels[None, :]).argmin(1)]
+        out = np.clip(out, 1, 127)
+        return np.clip(out + (v.mean() - out.mean()), 1, 127)
+
+    def _input_velocities(self, inp, tgt, rng):
+        """Rebuild the input's velocity BINS from the human take in tgt, replacing the
+        one frozen into the cache. inp and tgt are rotated and windowed together above,
+        so they line up note-for-note here. Shared by the train and validation paths -
+        they differ only in which rng they hand in."""
+        vscale = 128.0 / self.cfg.velocity_bins
+        deh = self._dehumanize_velocities(tgt['velocities'].astype(float) * vscale,
+                                          inp['instruments'], rng)
+        return np.clip((deh / vscale).round(), 0,
+                       self.cfg.velocity_bins - 1).astype(inp['velocities'].dtype)
+
+    def _augment_input(self, inp, tgt):
         inp = {k: v.copy() for k, v in inp.items()}
         n = len(inp['instruments'])
+        inp['velocities'] = self._input_velocities(inp, tgt, random)
         jitter = np.random.randint(-2, 3, size=n).astype(np.int32)
         inp['velocities'] = np.clip(inp['velocities'] + jitter, 0, self.cfg.velocity_bins - 1)
         if random.random() < 0.5:
@@ -1290,6 +1414,17 @@ class DrumDataset(Dataset):
         s = self.samples[idx]
         inp, tgt, length = s['input'], s['target'], s['length']
 
+        # DESIGN: validation must re-derive its input the same way training does - a val
+        # set still fed the cached de-humanization would be scoring a task the model is
+        # no longer being trained for (and an easier one, see _dehumanize_velocities).
+        # But it must ALSO be identical every epoch and across runs: early stopping and
+        # best.pt compare val numbers BETWEEN epochs, so a val set that redraws itself
+        # each pass is comparing against a moving target and the winner is partly luck.
+        # A per-sample RNG seeded from the index gives both - a fixed draw that still
+        # differs from sample to sample. Training keeps the global (freshly reseeded
+        # every epoch) `random`.
+        rng = random if self.augment else random.Random(_VAL_DEHUM_SEED + idx)
+
         # Bar-rotation augmentation (before windowing so phrases start at varied bars)
         if (self.augment and self.cfg.bar_rotation
                 and random.random() < self.cfg.bar_rotation_prob):
@@ -1298,11 +1433,19 @@ class DrumDataset(Dataset):
 
         L = self.cfg.max_seq_len
         if length > L:
-            start = random.randint(0, length - L)
+            # NOTE: drawn from `rng`, so a long val groove windows to the SAME slice
+            # every epoch. It used to use the global RNG in both modes, which quietly
+            # made val loss jump around on long grooves for reasons unrelated to the
+            # model - noise that early stopping and best.pt were reading as signal.
+            start = rng.randint(0, length - L)
             inp = self._window(inp, start, L)
             tgt = self._window(tgt, start, L)
         if self.augment:
-            inp = self._augment_input(inp)
+            inp = self._augment_input(inp, tgt)
+        else:
+            # Validation: the realistic de-humanization, fixed per sample. None of the
+            # training-only noise (velocity jitter, dropout, intensity shift) applies.
+            inp = {**inp, 'velocities': self._input_velocities(inp, tgt, rng)}
 
         vscale = 128.0 / self.cfg.velocity_bins
 
@@ -1369,26 +1512,141 @@ class DrumDataset(Dataset):
         }
 
 
+# DESIGN: how many bytes of dataset we're willing to copy into EACH DataLoader worker
+# on a 'spawn' platform before deciding workers aren't worth it. Copying more than this
+# per process is wasteful even when it happens to fit.
+_SPAWN_WORKER_BUDGET = 1024 ** 3
+
+
+def _estimate_pickle_bytes(samples, probe: int = 256) -> int:
+    """
+    Size of the pickle buffer this sample list would produce, extrapolated from a prefix.
+
+    DESIGN: measures pickle.dumps() rather than summing ndarray.nbytes, because the raw
+    payload is NOT the dominant cost. Each sample holds ~20 small arrays, so a large
+    cache carries millions of tiny objects whose pickle framing roughly DOUBLES the array
+    bytes - measured on a real cache: 1.26GB of ndarray payload serialized to a 2.5GB
+    pickle. Summing nbytes therefore under-reports by ~2x and would let the guard below
+    sail past exactly the caches that blow up. The pickle buffer is also the thing the
+    parent actually has to materialize in RAM per worker, so it's the honest number.
+    """
+    if not samples:
+        return 0
+    head = samples[:probe]
+    return int(len(pickle.dumps(head, protocol=4)) / len(head) * len(samples))
+
+
+def _resolve_num_workers(samples, cfg: Config) -> int:
+    """
+    DESIGN: on 'spawn' platforms (Windows, macOS) every DataLoader worker receives a
+    full PICKLED COPY of the Dataset, and the parent must materialize that entire
+    pickle buffer in RAM to hand it over. train and val each spawn cfg.num_workers, so
+    the real cost is roughly (2*num_workers + 1)x the sample list. On a large cache
+    this MemoryErrors inside w.start() before the first batch is ever produced - a
+    2.5GB / 166k-sample cache with num_workers=4 did exactly that on a 32GB machine,
+    after a multi-minute load, with a traceback pointing at multiprocessing internals
+    rather than at the actual cause.
+
+    Linux 'fork' shares those pages copy-on-write and is unaffected, so this only
+    downgrades where it actually matters.
+
+    num_workers=0 loads in the main process: no pickling, no IPC, no per-worker copy.
+    __getitem__ here is numpy slicing, so workers buy little for this model anyway.
+    Set DBH_FORCE_WORKERS=1 to keep the configured count regardless.
+    """
+    workers = max(0, cfg.num_workers)
+    if workers == 0 or not samples:
+        return workers
+    # get_start_method(allow_none=True) returns None until a context is actually fixed,
+    # which is the normal state here - so infer the platform default rather than treating
+    # "not yet decided" as spawn (that would wrongly downgrade fork platforms). Not using
+    # allow_none=False because that FIXES the start method as a side effect.
+    method = multiprocessing.get_start_method(allow_none=True)
+    if method is None:
+        method = 'fork' if sys.platform.startswith(('linux', 'freebsd')) else 'spawn'
+    if method == 'fork':
+        return workers
+    if os.environ.get('DBH_FORCE_WORKERS'):
+        return workers
+    est = _estimate_pickle_bytes(samples)
+    if est <= _SPAWN_WORKER_BUDGET:
+        return workers
+    projected = est * (2 * workers + 1)
+    print(f"  NOTE: dataset is ~{est / 1024**3:.1f}GB and this platform starts DataLoader "
+          f"workers by 'spawn', which copies it into every worker "
+          f"(~{projected / 1024**3:.1f}GB for {workers} workers x train+val).")
+    print(f"        Using num_workers=0 (main-process loading) instead - otherwise this "
+          f"MemoryErrors before the first batch. Set DBH_FORCE_WORKERS=1 to override.")
+    return 0
+
+
+def _split_by_song(samples, val_split: float):
+    """
+    Train/val split that keeps every section of a song on ONE side.
+
+    DESIGN: _split_events_into_sections cuts each song into section_bars windows every
+    hop_bars, so at the default 16/8 adjacent sections SHARE HALF THEIR BARS. Splitting
+    the flat sample list (what this used to do) therefore put a section in val while its
+    overlapping neighbour - same song, same bars, same human performance - sat in train.
+    At val_split=0.05 that happens to essentially every val section, so val loss was
+    partly measuring memorisation. Grouping by song_id removes it at the source.
+
+    Samples with no song_id (an older cache, or --synthetic) each become their own
+    group, which reproduces the old per-sample behaviour exactly rather than failing.
+    Returns (train, val, n_songs, song_aware).
+    """
+    groups, loose = {}, []
+    for smp in samples:
+        sid = smp.get('song_id')
+        if sid is None:
+            loose.append([smp])          # ungrouped: its own single-sample group
+        else:
+            groups.setdefault(sid, []).append(smp)
+    song_aware = bool(groups)
+    all_groups = list(groups.values()) + loose
+    random.shuffle(all_groups)           # global RNG, seeded via seed_everything()
+    n_val_target = max(1, int(len(samples) * val_split))
+    val, train = [], []
+    for g in all_groups:
+        (val if len(val) < n_val_target else train).extend(g)
+    # A corpus that is one long song (or one group holding nearly everything) would put
+    # every sample on one side. Fall back rather than train on an empty split.
+    if not train or not val:
+        print(f"[warning] song-aware split left one side empty ({len(train)} train / "
+              f"{len(val)} val) - the corpus is probably a single song. Falling back to "
+              f"a per-sample split; val will overlap train if sections overlap.")
+        shuffled = list(samples)
+        random.shuffle(shuffled)
+        n_val = max(1, int(len(shuffled) * val_split))
+        return shuffled[n_val:], shuffled[:n_val], len(all_groups), False
+    return train, val, len(all_groups), song_aware
+
+
 def make_loaders(samples, cfg: Config):
-    random.shuffle(samples)      # uses the global `random` RNG, seeded via seed_everything()
-    n_val = max(1, int(len(samples) * cfg.val_split))
-    val, train = samples[:n_val], samples[n_val:]
-    print(f"Train: {len(train)}  Val: {len(val)}")
+    train, val, n_songs, song_aware = _split_by_song(samples, cfg.val_split)
+    if song_aware:
+        print(f"Train: {len(train)}  Val: {len(val)}  "
+              f"(split by SONG across {n_songs} songs - no song appears on both sides)")
+    else:
+        print(f"Train: {len(train)}  Val: {len(val)}  "
+              f"(per-sample split: this cache has no song_id - rebuild it with "
+              f"--mode cache to get a song-aware split)")
+    workers = _resolve_num_workers(samples, cfg)
     # a dedicated, seeded torch.Generator for the shuffling DataLoader does, so the
     # train-batch ORDER is reproducible too, not just the RNGs used inside a sample.
     g = torch.Generator()
     g.manual_seed(GLOBAL_SEED)
     tl = DataLoader(DrumDataset(train, cfg, augment=True),
                     batch_size=cfg.batch_size, shuffle=True,
-                    num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
-                    persistent_workers=(cfg.num_workers > 0),
-                    worker_init_fn=_worker_init_fn if cfg.num_workers > 0 else None,
+                    num_workers=workers, pin_memory=True, drop_last=True,
+                    persistent_workers=(workers > 0),
+                    worker_init_fn=_worker_init_fn if workers > 0 else None,
                     generator=g)
     vl = DataLoader(DrumDataset(val, cfg, augment=False),
                     batch_size=cfg.batch_size, shuffle=False,
-                    num_workers=cfg.num_workers, pin_memory=True,
-                    persistent_workers=(cfg.num_workers > 0),
-                    worker_init_fn=_worker_init_fn if cfg.num_workers > 0 else None)
+                    num_workers=workers, pin_memory=True,
+                    persistent_workers=(workers > 0),
+                    worker_init_fn=_worker_init_fn if workers > 0 else None)
     return tl, vl
 
 
@@ -1549,13 +1807,27 @@ class RelPosEncoderLayer(nn.Module):
         q = self.q(h).view(B, T, self.nhead, self.dh).transpose(1, 2)   # (B,H,T,dh)
         k = self.k(h).view(B, T, self.nhead, self.dh).transpose(1, 2)
         v = self.v(h).view(B, T, self.nhead, self.dh).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.dh)          # (B,H,T,T)
+        # DESIGN: fused scaled_dot_product_attention instead of a hand-rolled
+        # QK^T/softmax/@V - measured 1.74x faster and ~45% less peak memory at this
+        # model's actual shapes (B=32,H=8,T=256,dh=32, base preset) on a GTX 1650,
+        # numerically verified equivalent to the old path (max output diff 1.8e-6).
+        # attn_mask, as a FLOAT tensor, gets ADDED to the raw scores before softmax -
+        # exactly the additive rel_bias + masked-fill(-inf) padding behavior this
+        # replaces, just fused into one kernel instead of four separate ops.
+        # dropout_p is passed explicitly because SDPA has no nn.Module state, so
+        # (unlike nn.Dropout) it won't auto-disable itself in eval() on its own.
+        attn_mask = None
         if rel_bias is not None:
-            scores = scores + rel_bias.unsqueeze(0)                      # broadcast over batch
-        if key_padding_mask is not None:
-            scores = scores.masked_fill(key_padding_mask[:, None, None, :], float('-inf'))
-        attn = self.drop(F.softmax(scores, dim=-1))
-        ctx = (attn @ v).transpose(1, 2).reshape(B, T, D)
+            attn_mask = rel_bias.unsqueeze(0).expand(B, self.nhead, T, T)
+            if key_padding_mask is not None:
+                attn_mask = attn_mask.masked_fill(key_padding_mask[:, None, None, :], float('-inf'))
+        elif key_padding_mask is not None:
+            attn_mask = torch.zeros(B, 1, 1, T, device=x.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(key_padding_mask[:, None, None, :], float('-inf'))
+        ctx = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask,
+            dropout_p=self.drop.p if self.training else 0.0)
+        ctx = ctx.transpose(1, 2).reshape(B, T, D)
         x = x + self.drop(self.o(ctx))
         x = x + self.drop(self.ff(self.n2(x)))
         return x
@@ -1617,12 +1889,38 @@ class HumanizationTransformer(nn.Module):
         if cfg.per_instrument_feel:
             self.feel_vel = nn.Embedding(cfg.num_instruments + 1, 1)
             self.feel_off = nn.Embedding(cfg.num_instruments + 1, 1)
-            nn.init.zeros_(self.feel_vel.weight)   # start neutral
-            nn.init.zeros_(self.feel_off.weight)
 
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+        # DESIGN: these two MUST be zeroed AFTER the blanket xavier_uniform_ above,
+        # not before. Their weight tensors are 2-D ((num_instruments+1, 1)), so the
+        # `p.dim() > 1` sweep matches them and silently overwrites a zero-init done
+        # earlier - which is exactly what used to happen here. With fan_in=1 xavier
+        # gives U(-0.63, 0.63), i.e. every voice started with a large RANDOM feel
+        # bias added straight onto its velocity/offset output, contradicting the
+        # "start neutral, learn the offset from data" intent of the feature.
+        if cfg.per_instrument_feel:
+            nn.init.zeros_(self.feel_vel.weight)   # start neutral (see note above)
+            nn.init.zeros_(self.feel_off.weight)
+
+        # DESIGN: depth-scaled residual init. In a pre-norm stack every layer ADDS its
+        # branch output to the residual stream, so the stream's variance grows ~linearly
+        # with depth; with plain Xavier on every projection a 20-layer model starts with
+        # a much hotter residual signal than a 6-layer one, which shows up as loss
+        # spikes / divergence in the first few hundred steps precisely at the depths
+        # `very_deep` introduces. Scaling each residual branch's OUTPUT projection by
+        # 1/sqrt(2*num_layers) (the standard GPT-2 style fix) keeps the post-stack
+        # variance roughly depth-independent, so one LR range stays usable across the
+        # whole preset ladder instead of needing a per-depth tune. Shallow presets are
+        # affected too, but harmlessly - it is a mild, uniform down-scaling there.
+        if self.layers is not None:
+            resid_scale = 1.0 / math.sqrt(2 * max(1, cfg.num_layers))
+            with torch.no_grad():
+                for layer in self.layers:
+                    layer.o.weight.mul_(resid_scale)          # attention out-projection
+                    layer.ff[-1].weight.mul_(resid_scale)     # FFN out-projection
 
     def _encode(self, batch):
         B, T = batch['instruments'].shape
@@ -1707,6 +2005,18 @@ def _top_k_filter(logits, k):
 
 def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
+def fmt_params(n: int) -> str:
+    """Compact parameter count for one-line summaries: 37,741,793 -> '37M'.
+    Truncates rather than rounds, so the number never reads higher than the model
+    actually is. Falls back to K/exact below a million (custom --d_model can land
+    there even though every MODEL_PRESETS entry is well above it)."""
+    if n >= 1_000_000:
+        return f"{n // 1_000_000}M"
+    if n >= 1_000:
+        return f"{n // 1_000}K"
+    return str(n)
 
 
 # =============================================================================
@@ -1842,8 +2152,248 @@ def evaluate(model, loader, device, cfg):
     return res
 
 
+# =============================================================================
+# CROSS-RUN LEADERBOARD
+# =============================================================================
+# A val_loss is only a number ABOUT something. Two runs' val_losses can be ranked
+# against each other only if they were measured on the same validation data with the
+# same loss - otherwise the "winner" is just whichever run had the easier task. That
+# is not hypothetical here: the input de-humanization is re-derived per sample now,
+# which made val strictly harder than it was for any run trained before it, and
+# data_fraction subsamples the sample list BEFORE make_loaders splits it, so two runs
+# at different fractions validate on different sets entirely. So every run stamps what
+# it was measured against, and only matching stamps get ranked together.
+
+# Bump this whenever a change alters what val_loss MEANS - the input recipe, the val
+# protocol, the loss definition. Runs carrying a different version, or none at all
+# (trained before stamping existed), are shown but never ranked.
+RECIPE_VERSION = 3
+
+# Config fields that set the SCALE of val_loss, or decide which samples land in val.
+_COMPARABILITY_FIELDS = ('target_mode', 'velocity_bins', 'max_offset_ticks',
+                         'grid_resolution', 'max_seq_len', 'val_split',
+                         'label_smoothing', 'vel_loss_weight', 'off_loss_weight')
+
+
+def run_fingerprint(cfg: Config, data_fraction: float, n_samples_full: int,
+                    song_aware: bool = False) -> Dict:
+    """Everything that must match for two runs' val_loss to mean the same thing.
+    n_samples_full and the seed are in here because the val split is the first
+    val_split share of the seed-shuffled sample list - change the corpus size or the
+    seed and the val set is different data, however similar the config looks."""
+    fp = {k: getattr(cfg, k, None) for k in _COMPARABILITY_FIELDS}
+    fp['recipe_version'] = RECIPE_VERSION
+    fp['data_fraction'] = round(float(data_fraction), 4)
+    fp['seed'] = GLOBAL_SEED
+    fp['n_samples_full'] = int(n_samples_full)
+    # Which samples land in val depends on whether the split could group by song, so a
+    # song-aware run and a per-sample-split run are not measuring the same val set even
+    # with everything else identical.
+    fp['song_aware_split'] = bool(song_aware)
+    return fp
+
+
+def samples_are_song_tagged(samples) -> bool:
+    """True if the cache carries song_id, i.e. make_loaders can split by song."""
+    return any('song_id' in smp for smp in samples)
+
+
+def _fingerprint_mismatch(saved: Optional[Dict], current: Dict) -> Optional[str]:
+    """None if the two are comparable, else a short human reason why they aren't."""
+    if not saved:
+        return "no run_meta.json (trained before runs were stamped)"
+    if saved.get('recipe_version') != current['recipe_version']:
+        return (f"recipe v{saved.get('recipe_version', '?')} "
+                f"!= v{current['recipe_version']} (different val task)")
+    diffs = [k for k, v in current.items() if saved.get(k) != v]
+    if diffs:
+        k = diffs[0]
+        extra = f" (+{len(diffs)-1} more)" if len(diffs) > 1 else ""
+        return f"{k}: {saved.get(k)} != {current[k]}{extra}"
+    return None
+
+
+def scan_previous_runs(current_fp: Dict, exclude=(), ckpt_root: str = 'checkpoints'):
+    """
+    Every checkpoints/<run>/ that already holds a finished epoch, split into the ones
+    rankable against current_fp and the ones that aren't (with the reason).
+
+    best_val is read from log.jsonl, not best.pt: recovering one float by torch.load-ing
+    a 60M-parameter checkpoint would cost seconds and gigabytes per run, and log.jsonl
+    already carries every epoch's val loss. Resumed runs append to it, so the minimum
+    over the file is still that run's best.
+    """
+    ranked, rejected = [], []
+    if not os.path.isdir(ckpt_root):
+        return ranked, rejected
+    for run_dir in sorted(glob.glob(os.path.join(ckpt_root, '*', ''))):
+        run_name = os.path.basename(os.path.normpath(run_dir))
+        if run_name in exclude:
+            continue          # trained in THIS sweep - the fresh result supersedes disk
+        log_path = os.path.join(run_dir, 'log.jsonl')
+        if not os.path.exists(log_path):
+            continue          # never finished an epoch; nothing to rank
+        try:
+            with open(log_path) as f:
+                vals = [json.loads(ln)['loss'] for ln in f if ln.strip()]
+            if not vals:
+                continue
+            meta_path = os.path.join(run_dir, 'run_meta.json')
+            saved = None
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    saved = json.load(f)
+            reason = _fingerprint_mismatch((saved or {}).get('fingerprint'), current_fp)
+            if reason:
+                rejected.append((run_name, reason))
+                continue
+            cfg_path = os.path.join(run_dir, 'config.json')
+            with open(cfg_path) as f:
+                rc = json.load(f)
+            ranked.append({
+                'run_name': run_name,
+                'model_size': saved.get('model_size', rc.get('model_size', '?')),
+                'batch_size': saved.get('batch_size', rc.get('batch_size', 0)),
+                'lr': saved.get('lr', rc.get('lr', 0.0)),
+                'best_val': min(vals),
+                'best_ckpt': os.path.join(run_dir, 'best.pt'),
+                'status': 'ok', 'source': 'prior',
+            })
+        except Exception as exc:
+            # A half-written log or a hand-edited config must not take the sweep down.
+            rejected.append((run_name, f"unreadable ({type(exc).__name__})"))
+    return ranked, rejected
+
+
+GRID_RESULTS_FILE = os.path.join('checkpoints', 'grid_results.json')
+
+# DESIGN: resolved against THIS FILE's directory, not the current working
+# directory - --mode infer and drum_bass_studio.py can both be launched from
+# anywhere, and the bundled pretrained model should be found either way.
+PRETRAINED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pretrained')
+DEFAULT_PRETRAINED_CHECKPOINT = os.path.join(PRETRAINED_DIR, 'humanizer_best.pt')
+DEFAULT_PRETRAINED_METADATA = os.path.join(PRETRAINED_DIR, 'humanizer_metadata.json')
+
+
+def export_pretrained(ckpt_path: str, run_name: str, val_loss: float,
+                      fingerprint: Dict, pretrained_dir: str = PRETRAINED_DIR) -> None:
+    """
+    Copy the winning checkpoint from checkpoints/<run>/best.pt into pretrained/, in a
+    form meant to be committed to the repo and used as the default at inference time.
+
+    DESIGN: NOT a raw copy of best.pt. That file also carries optimizer + scheduler
+    state (needed to resume training, useless for inference) which for this model is
+    ~2x the size of the weights themselves (measured: 250.8MB model vs 483.7MB
+    optimizer on a 60.6M-param 'huge' model - stripping it cuts the file to ~1/3).
+    load_model() only ever reads ck['model'] and ck['config'], so that's all this
+    keeps. metadata.json duplicates the human-relevant facts in a form readable
+    without loading the (still large) .pt file - what run this came from, how good it
+    is, and what data/recipe it's comparable against.
+
+    Best-effort: this runs after a long sweep/final-train has already produced the
+    real result, so a failure here (disk full, bad permissions) must not make the
+    run as a whole look like it failed - report and move on, same as write_grid_results.
+    """
+    try:
+        os.makedirs(pretrained_dir, exist_ok=True)
+        ck = torch.load(ckpt_path, map_location='cpu')
+        lean = {'model': ck['model'], 'config': ck['config']}
+        ckpt_out = os.path.join(pretrained_dir, 'humanizer_best.pt')
+        tmp = ckpt_out + '.tmp'
+        torch.save(lean, tmp)
+        os.replace(tmp, ckpt_out)   # atomic - a reader never sees a half-written model
+
+        meta = {
+            'saved': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'source_run': run_name,
+            'source_checkpoint': ckpt_path,
+            'val_loss': float(val_loss),
+            'model_size': ck['config'].get('model_size'),
+            'batch_size': ck['config'].get('batch_size'),
+            'lr': ck['config'].get('lr'),
+            'params': (lambda n: {'count': n, 'fmt': fmt_params(n)})(
+                sum(t.numel() for t in ck['model'].values())),
+            'fingerprint': fingerprint,
+            'note': ("Inference-only checkpoint (model weights + architecture config "
+                     "only) - no optimizer/scheduler state, so it cannot be used to "
+                     "--resume training. Produced by --mode grid_search; overwritten "
+                     "each time that sweep's winner changes."),
+        }
+        meta_out = os.path.join(pretrained_dir, 'humanizer_metadata.json')
+        tmp_meta = meta_out + '.tmp'
+        with open(tmp_meta, 'w') as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp_meta, meta_out)
+
+        size_mb = os.path.getsize(ckpt_out) / 1e6
+        print(f"Pretrained model updated -> {ckpt_out}  ({size_mb:.0f}MB, "
+              f"val_loss={val_loss:.4f}, from '{run_name}')")
+    except Exception as exc:
+        _report_error(f"could not export the winning checkpoint to '{pretrained_dir}' "
+                      f"(the run itself is unaffected - '{ckpt_path}' still has the "
+                      f"full result)", exc)
+
+
+def write_grid_results(results, rejected, fingerprint: Dict, axes: Dict,
+                       final_info: Optional[Dict] = None,
+                       path: str = GRID_RESULTS_FILE) -> None:
+    """
+    Persist the leaderboard grid_search() just printed, so it survives the terminal.
+
+    DESIGN: the sweep's whole output used to be stdout only - lose the scrollback and
+    the ranking was gone, even though every run's log.jsonl was still on disk. The
+    numbers were recoverable but only by hand-rebuilding what scan_previous_runs()
+    already computes, so this writes the assembled table once instead.
+
+    Called TWICE per sweep - right after the leaderboard prints, and again once the
+    auto final train has finished - because the final pass is the long, OOM-prone one:
+    if it dies, the ranking that cost the whole sweep must already be on disk. The
+    second call simply overwrites with `final` filled in.
+
+    Best-effort: a sweep that trained for hours must never die on a failed write, so
+    every error here is reported and swallowed.
+    """
+    try:
+        payload = {
+            'saved': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'fingerprint': fingerprint,   # what makes these val_losses comparable
+            'axes': axes,                 # what was swept, and at what data_fraction
+            'leaderboard': [
+                # null, not inf, for a failed run: json.dump would emit bare `Infinity`,
+                # which is not valid JSON and chokes strict parsers (jq included).
+                {'rank': i,
+                 'val_loss': (float(r['best_val']) if r['status'] == 'ok' else None),
+                 'model_size': r['model_size'], 'batch_size': int(r['batch_size']),
+                 'lr': float(r['lr']), 'run_name': r['run_name'],
+                 'source': r.get('source', 'sweep'), 'status': r['status'],
+                 'best_ckpt': r.get('best_ckpt')}
+                for i, r in enumerate(results, 1)
+            ],
+            # kept, not dropped: "why isn't my earlier run in the table" is exactly the
+            # question someone reads this file to answer.
+            'not_ranked': [{'run_name': n, 'reason': why} for n, why in rejected],
+            'final': final_info,
+        }
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)   # atomic: a reader never sees a half-written table
+        print(f"Leaderboard saved -> {path}")
+    except Exception as exc:
+        _report_error(f"could not save the grid-search leaderboard to '{path}' "
+                      f"(the sweep itself is unaffected - the table is printed above "
+                      f"and every run's log.jsonl is intact)", exc)
+
+
+# The epoch's closing batches are the ones worth seeing (final loss, the numbers the
+# epoch summary is about to be built from), so the live display always refreshes on
+# each of the last few batches regardless of where the print_every cadence landed.
+_LIVE_TAIL_BATCHES = 3
+
+
 def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str] = None,
-          meta: Optional[Dict] = None, data_fraction: float = 1.0):
+          meta: Optional[Dict] = None, data_fraction: float = 1.0, use_tensorboard: bool = True):
     device = torch.device('cuda' if torch.cuda.is_available()
                           else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -1851,6 +2401,34 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(ckpt_dir, 'config.json'), 'w') as f:
         json.dump(asdict(cfg), f, indent=2)
+
+    # AUTO-RESUME: if the caller didn't explicitly pass --resume, but this run_name
+    # already has a checkpoint (e.g. this exact command is being run again), continue
+    # from it automatically rather than silently starting over and overwriting the
+    # previous run's progress under the same name. An explicit --resume always wins -
+    # this only fills in the case where the user just re-ran the same training command.
+    auto_resumed = False
+    if resume is None:
+        auto_path = os.path.join(ckpt_dir, 'last.pt')
+        if os.path.exists(auto_path):
+            resume = auto_path
+            auto_resumed = True
+
+    # DESIGN: writes to checkpoints/<run_name>/tb, i.e. the SAME per-run directory
+    # grid_search() already gives each (batch_size, lr, model_size) combo. That means
+    # `tensorboard --logdir checkpoints` picks up every run - a standalone train() run
+    # AND every combo of a grid_search sweep - as its own line in one dashboard, with
+    # no extra plumbing needed in grid_search() beyond passing this flag through.
+    writer = None
+    if use_tensorboard:
+        if HAS_TENSORBOARD:
+            tb_dir = os.path.join(ckpt_dir, 'tb')
+            writer = SummaryWriter(log_dir=tb_dir)
+            print(f"TensorBoard: logging to {tb_dir}  "
+                  f"(view with: tensorboard --logdir checkpoints)")
+        else:
+            print("[note] TensorBoard requested but not installed - "
+                  "pip install tensorboard to enable. Continuing without it.")
 
     # ── Optional cap on training-file usage ─────────────────────────────────────
     # DESIGN: data_fraction subsamples the (already split+filtered) sample list
@@ -1869,6 +2447,23 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         samples = rng.sample(samples, n_keep)
         print(f"[data_fraction={data_fraction:.2f}] Using {n_keep}/{n_full} training "
               f"samples (random subset) - FASTER but less data than a full run.")
+
+    # Stamp what this run's val_loss will be measured against, so a later sweep can
+    # tell whether it is allowed to rank this run against its own (see run_fingerprint).
+    # Written here rather than beside config.json above because data_fraction and
+    # n_full - both part of what defines the val set - are only settled by this point.
+    try:
+        with open(os.path.join(ckpt_dir, 'run_meta.json'), 'w') as f:
+            json.dump({'fingerprint': run_fingerprint(cfg, data_fraction, n_full,
+                                                     samples_are_song_tagged(samples)),
+                       'model_size': cfg.model_size, 'batch_size': cfg.batch_size,
+                       'lr': cfg.lr, 'run_name': run_name,
+                       'saved': time.strftime('%Y-%m-%d %H:%M:%S')}, f, indent=2)
+    except Exception as exc:
+        # Losing the stamp costs this run its place in future leaderboards; it must
+        # not cost the training run itself.
+        print(f"[warning] couldn't write run_meta.json for '{run_name}' "
+              f"({type(exc).__name__}: {exc}) - this run won't be rankable later.")
 
     # ── Dataset provenance summary ────────────────────────────────────────────────
     # original MIDI files -> section-samples after song-splitting/quality-filter ->
@@ -1901,8 +2496,7 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         aug_per_epoch = int(round(n_split * cfg.bar_rotation_prob))
         print(f"  + augmentation (per epoch): ~{aug_per_epoch} of {n_split} samples "
               f"bar-rotated (p={cfg.bar_rotation_prob:.2f}); different picks each epoch")
-        print(f"  Effective items/epoch:    {n_split} "
-              f"(each may appear rotated or not - augmentation adds variety, not count)")
+        print(f"  Effective items/epoch:    {n_split}")
     else:
         print(f"  Total training items:     {n_split} (augmentation off)")
     print("─────────────────────────────────────────────────────\n")
@@ -1911,61 +2505,173 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
     model = HumanizationTransformer(cfg).to(device)
     print(f"Model size: '{cfg.model_size}'  "
           f"(d_model={cfg.d_model}, layers={cfg.num_layers}, heads={cfg.nhead}, "
-          f"ff={cfg.dim_feedforward}, dropout={cfg.dropout})")
-    print(f"Parameters: {count_params(model):,}")
+          f"ff={cfg.dim_feedforward}, dropout={cfg.dropout}, "
+          f"params={fmt_params(count_params(model))})")
     if cfg.bar_rotation:
-        print(f"Bar-rotation augmentation ON: drop first 2/4/8 bars for grooves "
-              f"≥4/≥8/≥16 bars, p={cfg.bar_rotation_prob:.2f} (varies phrase starts).")
+        print(f"Bar-rotation augmentation ON, p={cfg.bar_rotation_prob:.2f}.")
 
     opt = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    total_steps = max(1, len(train_loader)) * cfg.max_epochs
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = steps_per_epoch * cfg.max_epochs
     sched = OneCycleLR(opt, max_lr=cfg.lr, total_steps=total_steps, pct_start=cfg.warmup_pct)
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda')) if HAS_AMP else None
 
     start_epoch, best_val = 0, float('inf')
     if resume:
-        ck = torch.load(resume, map_location=device)
-        model.load_state_dict(ck['model']); opt.load_state_dict(ck['optimizer'])
-        sched.load_state_dict(ck['scheduler'])
-        start_epoch = ck['epoch'] + 1; best_val = ck.get('best_val', float('inf'))
-        print(f"Resumed at epoch {start_epoch} (best val {best_val:.4f})")
+        try:
+            ck = torch.load(resume, map_location=device)
+            model.load_state_dict(ck['model']); opt.load_state_dict(ck['optimizer'])
+            start_epoch = ck['epoch'] + 1; best_val = ck.get('best_val', float('inf'))
+
+            saved_total_steps = ck['scheduler'].get('total_steps')
+            if saved_total_steps == total_steps:
+                sched.load_state_dict(ck['scheduler'])
+            else:
+                # DESIGN: OneCycleLR bakes total_steps into its ENTIRE warmup/anneal
+                # shape at construction. Loading a state_dict built for a different
+                # total_steps (--epochs, --batch_size, or --data_fraction changed since
+                # this checkpoint was written - all of which change steps_per_epoch or
+                # cfg.max_epochs) doesn't fail here at load time - it silently corrupts
+                # internal bookkeeping and crashes much later on a real .step() call
+                # ("Tried to step N times, the specified number of total steps is M").
+                # `sched` was already constructed above using the CURRENT total_steps,
+                # so instead of loading incompatible old state, fast-forward this fresh
+                # one to the equivalent point (same completed-epoch count) in the NEW
+                # schedule - optimizer/model state restore normally; only the LR curve
+                # itself restarts shaped for the new run length.
+                steps_done = min(start_epoch * steps_per_epoch, total_steps)
+                # Fast-forwarding necessarily steps the schedule with no optimizer
+                # step behind it, which trips the same "lr_scheduler.step() before
+                # optimizer.step()" warning. It's correct here (the optimizer state
+                # for those steps was restored from the checkpoint), so silence it
+                # rather than printing a misleading warning on every such resume.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        'ignore', message=r'.*lr_scheduler\.step\(\).*before.*optimizer\.step\(\).*')
+                    for _ in range(steps_done):
+                        sched.step()
+                print(f"[note] LR schedule length changed since this checkpoint was "
+                      f"written (total_steps {saved_total_steps} -> {total_steps} - "
+                      f"likely --epochs/--batch_size/--data_fraction differs). "
+                      f"Continuing the LR schedule at the equivalent point in the NEW "
+                      f"schedule rather than loading incompatible old state.")
+
+            tag = "Auto-resumed" if auto_resumed else "Resumed"
+            print(f"{tag} from {resume} at epoch {start_epoch} (best val {best_val:.4f})")
+        except Exception as exc:
+            if not auto_resumed:
+                raise   # an explicit --resume that fails to load is a real error
+            # AUTO-resume found a checkpoint for this run_name but it wouldn't load -
+            # almost always an architecture/config mismatch (different d_model,
+            # target_mode, velocity_bins, max_seq_len, etc. than whatever produced it).
+            # The user only asked to auto-resume when it's actually compatible, so fall
+            # back to a fresh model rather than crashing on an incompatibility they
+            # likely introduced on purpose (e.g. changed --model_size for this run).
+            print(f"[warning] found an existing checkpoint for run_name '{run_name}' "
+                  f"at '{resume}' but couldn't load it ({type(exc).__name__}: {exc}).")
+            print(f"          Likely a different model config than produced it "
+                  f"(architecture/target_mode/velocity_bins/max_seq_len/etc). Starting "
+                  f"fresh instead - this WILL overwrite that checkpoint as training "
+                  f"proceeds. Use a different --run_name to keep both.")
+            start_epoch, best_val = 0, float('inf')
 
     bad = 0
     log_path = os.path.join(ckpt_dir, 'log.jsonl')
-    num_batches = max(1, len(train_loader))
+    num_batches = steps_per_epoch
     for epoch in range(start_epoch, cfg.max_epochs):
         model.train()
         run_loss = run_vel = run_off = 0.0
         t0 = time.time()
-        for step, batch in enumerate(train_loader):
-          try:
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            opt.zero_grad()
-            if scaler is not None:
-                with autocast('cuda'):
+        # DESIGN: tqdm gives a live countdown/ETA (elapsed<remaining) - the same style
+        # drum_theme_segmentation.py's dataset-build step already uses. Falls back to
+        # the original in-place text print (loss/lr every --print_every batches, no
+        # ETA) when tqdm isn't installed, so it never becomes a hard dep.
+        # bar_format drops tqdm's default rate ({rate_fmt}) - per-batch throughput
+        # swings with sequence length and tells you nothing --epochs/ETA doesn't.
+        # mininterval=inf disables tqdm's own timed refresh so the bar redraws ONLY
+        # on the cadence below, keeping the displayed numbers and the redraw the same
+        # event instead of two competing clocks. That also means the bar is driven
+        # manually (bar.update(1) per batch) rather than wrapped around the loader:
+        # tqdm's iterator only advances its counter inside a refresh, so wrapping it
+        # with refreshes suppressed would freeze n/ETA at 0 for the whole epoch.
+        step = -1
+        bar = (tqdm.tqdm(total=num_batches,
+                         desc=f"Epoch {epoch+1}/{cfg.max_epochs}", unit="batch",
+                         mininterval=float('inf'),
+                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                                    "[{elapsed}<{remaining}{postfix}]")
+               if HAS_TQDM else None)
+        try:
+            for step, batch in enumerate(train_loader):
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                opt.zero_grad()
+                if scaler is not None:
+                    with autocast('cuda'):
+                        out = model(batch)
+                        loss, parts = compute_loss(out, batch, cfg)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    # DESIGN: GradScaler SKIPS optimizer.step() entirely on any batch
+                    # whose unscaled grads came out inf/nan - which is guaranteed for
+                    # the first batch or two of every run, since the scale starts at
+                    # 65536 and has to overflow to find a workable value. Stepping the
+                    # LR schedule on a skipped batch advances OneCycleLR past LRs the
+                    # weights never actually trained at, and on batch 0 it's also what
+                    # raises PyTorch's "lr_scheduler.step() before optimizer.step()"
+                    # warning. update() halves the scale exactly when the step was
+                    # skipped and never lowers it otherwise, so comparing the scale
+                    # across it is the documented way to detect that.
+                    scale_before = scaler.get_scale()
+                    scaler.step(opt); scaler.update()
+                    stepped = scaler.get_scale() >= scale_before
+                else:
                     out = model(batch)
                     loss, parts = compute_loss(out, batch, cfg)
-                scaler.scale(loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                scaler.step(opt); scaler.update()
-            else:
-                out = model(batch)
-                loss, parts = compute_loss(out, batch, cfg)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                opt.step()
-            sched.step()
-            run_loss += loss.item(); run_vel += parts['vel_loss']; run_off += parts['off_loss']
-            # batch progress: overwrite the SAME line every 10 batches (and on the last)
-            if (step + 1) % 10 == 0 or step == num_batches - 1:
-                print(f"\r  Epoch {epoch+1}/{cfg.max_epochs}  batch {step+1}/{num_batches}  "
-                      f"loss={loss.item():.4f} vel={parts['vel_loss']:.4f} "
-                      f"off={parts['off_loss']:.4f} lr={sched.get_last_lr()[0]:.2e}   ",
-                      end='', flush=True)
-          except RuntimeError as exc:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    opt.step()
+                    stepped = True
+                if stepped:
+                    sched.step()
+                run_loss += loss.item(); run_vel += parts['vel_loss']; run_off += parts['off_loss']
+                cur_loss = loss.item()
+                # One cadence for both display paths: every cfg.print_every batches,
+                # plus each of the epoch's last _LIVE_TAIL_BATCHES.
+                show_live = ((step + 1) % cfg.print_every == 0
+                             or step >= num_batches - _LIVE_TAIL_BATCHES)
+                if bar is not None:
+                    bar.update(1)      # counter/ETA advance every batch; drawing does not
+                    if show_live:
+                        # set_postfix_str(refresh=True) is the redraw - it bypasses
+                        # mininterval, so this is the only thing that paints the bar.
+                        bar.set_postfix_str(
+                            f"loss={cur_loss:.4f} vel={parts['vel_loss']:.4f} "
+                            f"off={parts['off_loss']:.4f} lr={sched.get_last_lr()[0]:.2e}")
+                # in-place text print: overwrite the SAME line on that same cadence -
+                # only when tqdm isn't doing the display, so the two update mechanisms
+                # never fight.
+                elif show_live:
+                    print(f"\r  Epoch {epoch+1}/{cfg.max_epochs}  batch {step+1}/{num_batches}  "
+                          f"loss={cur_loss:.4f} vel={parts['vel_loss']:.4f} "
+                          f"off={parts['off_loss']:.4f} lr={sched.get_last_lr()[0]:.2e}",
+                          end='', flush=True)
+                # logged on the print_every cadence regardless of display mode - a
+                # scalar every single batch (often thousands/epoch) adds real overhead
+                # for no visual gain, since TensorBoard itself downsamples dense series.
+                if writer is not None and ((step + 1) % cfg.print_every == 0 or step == num_batches - 1):
+                    gstep = epoch * num_batches + step
+                    writer.add_scalar('batch/loss', cur_loss, gstep)
+                    writer.add_scalar('batch/vel_loss', parts['vel_loss'], gstep)
+                    writer.add_scalar('batch/off_loss', parts['off_loss'], gstep)
+                    writer.add_scalar('batch/lr', sched.get_last_lr()[0], gstep)
+            if bar is not None:
+                bar.close()
+        except RuntimeError as exc:
             # Most training-step RuntimeErrors are CUDA OOM or a shape mismatch.
             # Report epoch/batch and the exact line, with actionable guidance for OOM.
+            if bar is not None:
+                bar.close()
             if 'out of memory' in str(exc).lower():
                 _report_error(f"training ran out of GPU memory at epoch {epoch+1} "
                               f"batch {step+1}/{num_batches} - reduce --batch_size or "
@@ -1975,27 +2681,46 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
             else:
                 _report_error(f"training step failed at epoch {epoch+1} "
                               f"batch {step+1}/{num_batches}", exc, fatal=True)
+            if writer is not None:
+                writer.close()
             raise   # a broken training step is fatal - don't silently continue
-        print()   # newline after the in-place batch counter finishes for this epoch
 
         nb = num_batches
         val = evaluate(model, val_loader, device, cfg)
-        print(f"Epoch {epoch:03d}  train={run_loss/nb:.4f} "
-              f"(vel={run_vel/nb:.4f} off={run_off/nb:.4f})  "
-              f"val={val['loss']:.4f}  vel_mae={val['vel_mae']:.2f}(vel)  "
-              f"off_mae={val['off_mae']:.2f}(ticks)  {time.time()-t0:.0f}s")
+        # The epoch summary APPENDS to the in-place batch-counter line (no newline was
+        # printed above), so each epoch occupies exactly one line: the batch counter
+        # ends at the last batch, then '|' separates it from the epoch's own stats.
+        is_best = val['loss'] < best_val
+        best_tag = "  (✓ new best)" if is_best else ""
+        print(f" | train={run_loss/nb:.4f} (vel={run_vel/nb:.4f} off={run_off/nb:.4f})  "
+              f"val={val['loss']:.4f}  vel_mae={val['vel_mae']:.2f}  "
+              f"off_mae={val['off_mae']:.2f}t  {time.time()-t0:.0f}s{best_tag}")
         with open(log_path, 'a') as f:
             f.write(json.dumps({'epoch': epoch, 'train_loss': run_loss/nb, **val}) + '\n')
+        if writer is not None:
+            writer.add_scalar('epoch/train_loss', run_loss / nb, epoch)
+            writer.add_scalar('epoch/val_loss', val['loss'], epoch)
+            writer.add_scalar('epoch/val_vel_mae', val['vel_mae'], epoch)
+            writer.add_scalar('epoch/val_off_mae', val['off_mae'], epoch)
+            writer.add_scalar('epoch/lr', sched.get_last_lr()[0], epoch)
+            writer.flush()
 
+        # DESIGN: best_val is updated BEFORE building `ck`, so last.pt (saved every
+        # epoch) always carries the TRUE current best - not the value from before this
+        # epoch's own improvement. Previously best_val only updated inside the `if
+        # is_best` branch after last.pt had already been written, so resuming from
+        # last.pt (including auto-resume) silently restored a stale, one-epoch-old
+        # best_val - which also corrupts early-stopping's baseline after a resume.
+        if is_best:
+            best_val = val['loss']
         ck = {'epoch': epoch, 'model': model.state_dict(),
               'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(),
               'best_val': best_val, 'config': asdict(cfg)}
         try:
             torch.save(ck, os.path.join(ckpt_dir, 'last.pt'))
-            if val['loss'] < best_val:
-                best_val = val['loss']; ck['best_val'] = best_val
+            if is_best:
                 torch.save(ck, os.path.join(ckpt_dir, 'best.pt'))
-                print(f"  ✓ new best (val={best_val:.4f})"); bad = 0
+                bad = 0
             else:
                 bad += 1
                 if bad >= cfg.early_stop_patience:
@@ -2006,6 +2731,8 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
             _report_error(f"saving checkpoint for epoch {epoch+1} to '{ckpt_dir}' "
                           f"(disk full or permissions?)", exc, fatal=True)
     print(f"\nDone. Best val loss: {best_val:.4f}  ->  {ckpt_dir}/best.pt")
+    if writer is not None:
+        writer.close()
     return {'best_val': best_val, 'ckpt_dir': ckpt_dir,
             'best_ckpt': os.path.join(ckpt_dir, 'best.pt')}
 
@@ -2014,30 +2741,59 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
                 batch_sizes: Optional[List[int]] = None,
                 lrs: Optional[List[float]] = None,
                 model_sizes: Optional[List[str]] = None,
-                run_prefix: str = "grid", data_fraction: Optional[float] = None):
+                run_prefix: str = "grid", data_fraction: Optional[float] = None,
+                use_tensorboard: bool = True,
+                auto_final_train: bool = True, final_epoch_multiplier: int = 10,
+                final_run_name: Optional[str] = None):
     """
     Full-factorial sweep over batch_size × lr × model_size. Trains one model per
     combination (starting from base_cfg for everything else), evaluates each on its
     own held-out validation split via the SAME train()/evaluate() path used normally,
     and prints every result sorted BEST FIRST (lowest validation loss).
 
-    DESIGN: this is intentionally the small, explicit grid you asked for - 3 batch
-    sizes × 2 lrs × all model sizes - not the full 60-argument space. Every other
-    setting is held fixed at base_cfg (whatever defaults/overrides you already
-    applied, e.g. bar_rotation ON, rel_pos ON, etc.), so this sweep isolates exactly
-    those three axes. Each run gets its own checkpoint dir so nothing overwrites.
+    DESIGN: this is intentionally the small, explicit grid you asked for, not the
+    full 60-argument space. Every other setting is held fixed at base_cfg (whatever
+    defaults/overrides you already applied, e.g. bar_rotation ON, rel_pos ON, etc.),
+    so this sweep isolates exactly the batch_size/lr/model_size axes. Each run gets
+    its own checkpoint dir so nothing overwrites.
 
     data_fraction: SCREENING speed-up. A full grid trains N models on the FULL
     dataset, which is wasteful - you mostly need each combo's RELATIVE ranking, not
     its final quality. Default (None) auto-picks a reasonable fraction based on how
     many combos there are (more combos -> smaller fraction per run), floored at 15%
     and capped at 100%. Pass 1.0 to disable and use the full dataset for every run.
-    After the sweep, retrain the winning combo alone at data_fraction=1.0 for the
-    real, final model - the sweep is for RANKING, not for producing the deliverable.
+
+    auto_final_train: after ranking, automatically retrain the winning combo alone
+    at data_fraction=1.0 for final_epoch_multiplier x base_cfg.max_epochs epochs -
+    the sweep is for RANKING (cheap, on a data subset), this second pass is for the
+    actual DELIVERABLE (full data, more epochs since it's the one model you keep).
+    Only fires when the sweep itself used a subset (data_fraction < 1.0) AND at
+    least one combo succeeded - a sweep already run at data_fraction=1.0 has nothing
+    to "upgrade" to, and there's no winner to retrain if every combo failed.
+    Skippable (auto_final_train=False) if you'd rather review the leaderboard first
+    and retrain by hand.
     """
-    batch_sizes = batch_sizes or [16, 32, 64]
-    lrs = lrs or [1e-4, 3e-4]
-    model_sizes = model_sizes or list(MODEL_PRESETS.keys())
+    # DESIGN: narrowed from the original 3 batch sizes x 2 lrs x {huge, very_deep} grid
+    # (Aug 2026, this RTX 4090, recipe v3) to just the winning corner, on the evidence
+    # of that actual run (checkpoints/grid_results.json):
+    #  - batch_size: 128 beat 64 in all 4 head-to-head pairings (every model x lr combo)
+    #    by 0.02-0.03 val_loss. 192 doesn't fit `huge` on a 24GB card (measured: 128
+    #    peaks at 18.7GB, 160 at 23.1GB with ~450MB headroom, 192 OOMs outright) - 128
+    #    is both the best-scoring and the largest that fits with real margin.
+    #  - model_size: huge beat very_deep at every batch_size x lr point tested (e.g.
+    #    7.8583 vs 7.8783 at bs128/lr8e-4) despite very_deep being deeper (20 vs 18
+    #    layers) - more depth stopped helping once huge's wider d_model (512 vs 384)
+    #    was in play, so very_deep is dropped rather than kept as a hedge.
+    #  - lr: at bs128 higher lr won BOTH times tested (4e-4 -> 8e-4 improved val_loss
+    #    ~0.02-0.03), and 8e-4 was the top of the tested range - the trend was still
+    #    climbing, not yet peaked. The default axis below extends upward from there
+    #    (toward the linear-scaling-rule prediction of ~1.2e-3 for bs128 off
+    #    Config.lr=3e-4 @ bs=32) rather than re-testing 4e-4, which lost clearly. The
+    #    old 8e-4 checkpoint still surfaces in the leaderboard automatically via
+    #    scan_previous_runs (same fingerprint), so it anchors the comparison for free.
+    batch_sizes = batch_sizes or [128]
+    lrs = lrs or [1e-3, 1.2e-3, 1.6e-3]
+    model_sizes = model_sizes or ["huge"]
 
     combos = [(bs, lr, ms) for bs in batch_sizes for lr in lrs for ms in model_sizes]
     total = len(combos)
@@ -2054,13 +2810,49 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
     print(f"  -> {len(batch_sizes)} × {len(lrs)} × {len(model_sizes)} = {total} runs")
     print(f"  data_fraction per run = {data_fraction:.2f}  "
           f"({'full dataset' if data_fraction >= 1.0 else 'SCREENING subset - retrain the winner at 1.0 for the final model'})")
+    if use_tensorboard and HAS_TENSORBOARD:
+        print(f"  TensorBoard: tensorboard --logdir checkpoints   "
+              f"(every combo's run_name appears as its own line)")
+
+    # ── PREFLIGHT: disk ──────────────────────────────────────────────────────────
+    # DESIGN: every run writes best.pt AND last.pt, and each holds model params +
+    # AdamW's two momentum buffers (~12 bytes/param total, x2 files = ~24). At the
+    # big end of the preset ladder that is ~0.9GB PER COMBO, so a wide sweep can
+    # quietly need tens of GB. A disk-full failure surfaces as a checkpoint-save
+    # error mid-sweep (train() warns and continues), meaning an unattended overnight
+    # run could finish having silently saved nothing - worth 2 lines to predict.
+    est_ckpt_bytes = 0
+    for ms in model_sizes:
+        p = MODEL_PRESETS[ms]
+        approx_params = (p['num_layers'] * (4 * p['d_model'] ** 2
+                                            + 2 * p['d_model'] * p['dim_feedforward'])
+                         + 4_000_000)          # rough embeddings/heads allowance
+        est_ckpt_bytes += approx_params * 24 * len(batch_sizes) * len(lrs)
+    est_gb = est_ckpt_bytes / 1024 ** 3
+    print(f"  Estimated checkpoint disk usage: ~{est_gb:.1f} GB "
+          f"({total} runs x best.pt+last.pt)")
+    try:
+        free_gb = shutil.disk_usage(os.path.abspath('checkpoints') if os.path.isdir('checkpoints')
+                                    else '.').free / 1024 ** 3
+        print(f"  Free disk on that volume:        ~{free_gb:.1f} GB")
+        if free_gb < est_gb * 1.15:
+            print(f"  *** WARNING: that is not a comfortable margin. Checkpoint saves "
+                  f"fail LATE (mid-sweep) and train() only warns, so the sweep would "
+                  f"keep running while saving nothing. Free space, or narrow the grid.")
+    except Exception:
+        pass   # disk_usage is best-effort - never block a sweep over a stat() failure
+
     print(f"====================================================\n")
 
     results = []
     for i, (bs, lr, ms) in enumerate(combos):
-        run_name = f"{run_prefix}_{ms}_bs{bs}_lr{lr:.0e}"
-        print(f"\n########## RUN {i+1}/{total}: model_size={ms}  batch_size={bs}  lr={lr:.2e} "
-              f"(run_name='{run_name}') ##########")
+        # DESIGN: .2e, not .0e - zero decimal digits collapses close lrs onto the same
+        # name (1e-3 and 1.2e-3 both round to "1e-03"), which made a real sweep here
+        # silently auto-resume combo 2 from combo 1's already-finished checkpoint and
+        # report combo 1's val_loss as combo 2's, without training combo 2 at all.
+        run_name = f"{run_prefix}_{ms}_bs{bs}_lr{lr:.2e}"
+        print(f"\n##### RUN {i+1}/{total}: model_size={ms}  bs={bs}  lr={lr:.2e} "
+              f"(run_name='{run_name}') #####")
         # Re-seed before EVERY combo: without this, combo #5's model init/dropout/
         # augmentation stream depends on how much RNG state combos #1-4 consumed,
         # so results wouldn't be reproducible independent of sweep order/composition.
@@ -2073,11 +2865,12 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
         cfg.batch_size = bs
         cfg.lr = lr
         try:
-            info = train(cfg, samples, run_name, meta=meta, data_fraction=data_fraction)
+            info = train(cfg, samples, run_name, meta=meta, data_fraction=data_fraction,
+                        use_tensorboard=use_tensorboard)
             results.append({
                 'run_name': run_name, 'model_size': ms, 'batch_size': bs, 'lr': lr,
                 'best_val': info['best_val'], 'best_ckpt': info['best_ckpt'],
-                'params': None, 'status': 'ok',
+                'status': 'ok', 'source': 'sweep',
             })
         except Exception as exc:
             # One failing config (e.g. OOM on a large model_size/batch_size combo)
@@ -2086,37 +2879,143 @@ def grid_search(base_cfg: Config, samples: List[Dict], meta: Optional[Dict] = No
             results.append({
                 'run_name': run_name, 'model_size': ms, 'batch_size': bs, 'lr': lr,
                 'best_val': float('inf'), 'best_ckpt': None,
-                'params': None, 'status': f'FAILED: {type(exc).__name__}: {exc}',
+                'status': f'FAILED: {type(exc).__name__}: {exc}', 'source': 'sweep',
             })
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # ── sort BEST FIRST (lowest validation loss) and print the leaderboard ─────────
+    # ── merge in earlier runs, sort BEST FIRST, print the leaderboard ─────────────
+    # Combos from this sweep plus every run already in checkpoints/ that was measured
+    # against the same val set with the same loss, so the ranking reflects everything
+    # tried so far and not just this invocation. Runs that AREN'T comparable are listed
+    # separately with the reason rather than silently dropped or - far worse - ranked
+    # anyway, where an easier val task would look like a better model.
+    fingerprint = run_fingerprint(base_cfg, data_fraction, len(samples),
+                                  samples_are_song_tagged(samples))
+    prior, rejected = scan_previous_runs(
+        fingerprint, exclude={r['run_name'] for r in results})
+    results.extend(prior)
     results.sort(key=lambda r: r['best_val'])
     print(f"\n\n=================== GRID SEARCH RESULTS (best first) ===================")
     if data_fraction < 1.0:
         print(f"  (each run used a {data_fraction:.0%} random subset of the data - "
               f"for RANKING/screening, not final quality)")
+    if prior:
+        print(f"  ({len(prior)} earlier run(s) from checkpoints/ included - same val "
+              f"set, same loss, so the numbers are directly comparable)")
     print(f"{'rank':>4}  {'val_loss':>10}  {'model_size':>10}  {'batch':>6}  {'lr':>9}  "
-          f"{'run_name':<28}  status")
-    print("-" * 100)
+          f"{'run_name':<28}  {'from':>6}  status")
+    print("-" * 110)
     for rank, r in enumerate(results, 1):
         vloss = f"{r['best_val']:.4f}" if r['status'] == 'ok' else "   -"
         print(f"{rank:>4}  {vloss:>10}  {r['model_size']:>10}  {r['batch_size']:>6}  "
-              f"{r['lr']:>9.2e}  {r['run_name']:<28}  {r['status']}")
+              f"{r['lr']:>9.2e}  {r['run_name']:<28}  {r.get('source', 'sweep'):>6}  "
+              f"{r['status']}")
+    if rejected:
+        print(f"\n  Not ranked - these runs exist in checkpoints/ but their val_loss "
+              f"was not measured on this val set / loss, so it is not a like-for-like "
+              f"number:")
+        for run_name, reason in rejected[:12]:
+            print(f"    {run_name:<34}  {reason}")
+        if len(rejected) > 12:
+            print(f"    ... and {len(rejected) - 12} more")
+    # Save NOW, before the auto final train: that pass is the long, OOM-prone one, and
+    # the ranking above cost the entire sweep. Rewritten with `final` once it finishes.
+    axes = {'batch_sizes': batch_sizes, 'lrs': lrs, 'model_sizes': model_sizes,
+            'data_fraction': data_fraction, 'sweep_epochs': base_cfg.max_epochs,
+            'run_prefix': run_prefix}
+    write_grid_results(results, rejected, fingerprint, axes)
     ok = [r for r in results if r['status'] == 'ok']
+    final_info = None
     if ok:
         best = ok[0]
+        origin = ("this sweep" if best.get('source', 'sweep') == 'sweep'
+                  else "an EARLIER run in checkpoints/")
         print(f"\nBest: {best['run_name']}  (val_loss={best['best_val']:.4f})  "
-              f"-> {best['best_ckpt']}")
+              f"from {origin}  -> {best['best_ckpt']}")
         if data_fraction < 1.0:
-            print(f"  -> This ranking used only {data_fraction:.0%} of the data. Retrain "
-                  f"model_size={best['model_size']} batch_size={best['batch_size']} "
-                  f"lr={best['lr']:.2e} with --data_fraction 1.0 for the real final model.")
+            final_epochs = base_cfg.max_epochs * final_epoch_multiplier
+            fr_name = final_run_name or f"{run_prefix}_final"
+            if not auto_final_train:
+                print(f"  -> This ranking used only {data_fraction:.0%} of the data. Retrain "
+                      f"model_size={best['model_size']} batch_size={best['batch_size']} "
+                      f"lr={best['lr']:.2e} with --data_fraction 1.0 for the real final model.")
+            else:
+                print(f"\n=================== AUTO FINAL TRAIN ===================")
+                print(f"  The sweep above only ranked combos on a {data_fraction:.0%} data "
+                      f"subset - now training the winner on the FULL dataset for the "
+                      f"actual deliverable.")
+                print(f"  model_size={best['model_size']}  batch_size={best['batch_size']}  "
+                      f"lr={best['lr']:.2e}")
+                print(f"  run_name={fr_name}  epochs={final_epochs} "
+                      f"({final_epoch_multiplier}x the sweep's {base_cfg.max_epochs})  "
+                      f"data_fraction=1.0")
+                print(f"==========================================================\n")
+                seed_everything(GLOBAL_SEED, verbose=False)
+                final_cfg = Config(**{k: v for k, v in asdict(base_cfg).items()
+                                      if k in Config.__dataclass_fields__
+                                      and Config.__dataclass_fields__[k].init})
+                apply_model_preset(final_cfg, best['model_size'])
+                final_cfg.batch_size = best['batch_size']
+                final_cfg.lr = best['lr']
+                final_cfg.max_epochs = final_epochs
+                # DESIGN: the final train is the ONLY deliverable of the whole run, so
+                # unlike a sweep combo (where a failure just drops one leaderboard row)
+                # an OOM here must not end the session empty-handed. The sweep ranked
+                # this combo at data_fraction<1.0; the final pass uses the FULL dataset,
+                # which does not change per-batch VRAM but does change how long memory
+                # stays fragmented - so a batch size that squeaked through screening can
+                # still OOM here. Retry once at half batch (LR scaled with it, per the
+                # linear-scaling rule) rather than losing the run.
+                for attempt in (1, 2):
+                    try:
+                        final_info = train(final_cfg, samples, fr_name, meta=meta,
+                                           data_fraction=1.0, use_tensorboard=use_tensorboard)
+                        print(f"\nFinal model -> {final_info['best_ckpt']}  "
+                              f"(best_val={final_info['best_val']:.4f})")
+                        break
+                    except Exception as exc:
+                        is_oom = 'out of memory' in str(exc).lower()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if attempt == 1 and is_oom and final_cfg.batch_size > 1:
+                            new_bs = max(1, final_cfg.batch_size // 2)
+                            new_lr = final_cfg.lr * (new_bs / final_cfg.batch_size)
+                            print(f"\n[final train] OOM at batch_size="
+                                  f"{final_cfg.batch_size}. Retrying once at "
+                                  f"batch_size={new_bs}, lr={new_lr:.2e} (LR halved with "
+                                  f"the batch, per the linear-scaling rule).")
+                            final_cfg.batch_size = new_bs
+                            final_cfg.lr = new_lr
+                            # a different run_name so the retry cannot auto-resume from
+                            # the OOMed attempt's incompatible half-written checkpoint
+                            fr_name = f"{fr_name}_bs{new_bs}"
+                            seed_everything(GLOBAL_SEED, verbose=False)
+                            continue
+                        _report_error(f"auto final-train on the winning combo "
+                                      f"('{fr_name}') failed", exc, fatal=True)
+                        break
     else:
         print("\nAll runs failed - see [ERROR] messages above.")
+    if final_info is not None:
+        write_grid_results(results, rejected, fingerprint, axes, final_info=final_info)
+    # DESIGN: the pretrained/ export always reflects the actual DELIVERABLE. If the
+    # auto final train ran, that's the full-data retrain (final_info); if it didn't
+    # (data_fraction=1.0, so there was nothing to "upgrade" to, or --no_grid_final_train),
+    # it's the sweep's own best row instead. Either way this is "the best model of the
+    # last run," never a run from a PRIOR invocation's leaderboard - overwritten every
+    # time grid_search finishes, unconditionally, so pretrained/ always tracks the most
+    # recent run rather than silently keeping an older-but-still-technically-better one.
+    if ok:
+        if final_info is not None:
+            export_pretrained(final_info['best_ckpt'],
+                              final_run_name or f"{run_prefix}_final",
+                              final_info['best_val'], fingerprint)
+        else:
+            export_pretrained(best['best_ckpt'], best['run_name'], best['best_val'],
+                              fingerprint)
     print("=" * 100)
-    return results
+    return {'sweep_results': results, 'final': final_info}
 
 
 # =============================================================================
@@ -2139,7 +3038,8 @@ def load_model(checkpoint: str, device):
         raise
     size = getattr(cfg, 'model_size', '?')
     print(f"Loaded {checkpoint}  (model size '{size}': "
-          f"d_model={cfg.d_model}, layers={cfg.num_layers}, {count_params(model):,} params)")
+          f"d_model={cfg.d_model}, layers={cfg.num_layers}, "
+          f"params={fmt_params(count_params(model))})")
     return model, cfg
 
 
@@ -2498,7 +3398,9 @@ def main():
     p.add_argument('--synthetic_n', type=int, default=2000)
     p.add_argument('--run_name', default='run_001')
     p.add_argument('--resume', default=None)
-    p.add_argument('--checkpoint', default=None)
+    p.add_argument('--checkpoint', default=None,
+                   help="trained model (best.pt). If omitted, falls back to the "
+                        "bundled pretrained/humanizer_best.pt if present.")
     p.add_argument('--input', default=None)
     p.add_argument('--output', default='humanized.mid')
     p.add_argument('--epochs', type=int, default=None)
@@ -2506,19 +3408,47 @@ def main():
     p.add_argument('--lr', type=float, default=None)
     p.add_argument('--model_size', default=None,
                    choices=list(MODEL_PRESETS.keys()),
-                   help='progressively deeper presets: tiny->small->base(default)->'
-                        'deep->deeper->huge. Deeper models may capture more musical '
-                        'intuition but need more data/compute and can overfit. '
+                   help='progressively bigger presets: tiny->small->base(default)->'
+                        'deep->deeper->very_deep->huge. Deeper models may capture more '
+                        'musical intuition but need more data/compute and can overfit. '
+                        'very_deep is the DEEPEST (20 layers) but narrower than huge, so '
+                        'it has fewer params (37.7M vs 60.6M) - depth-first by design; '
+                        'see the --model_size note in README.md for the measurements. '
                         'Set at TRAIN time; inference reads it from the checkpoint.')
     p.add_argument('--grid_batch_sizes', type=str, default=None,
-                   help="GRID_SEARCH: comma-separated batch sizes, e.g. '16,32,64' "
-                        "(default: 16,32,64).")
+                   help="GRID_SEARCH: comma-separated batch sizes, e.g. '64,128' "
+                        "(default: 128 - the Aug 2026 sweep on this 4090 showed 128 "
+                        "beating 64 in every pairing, and 128 is the largest that fits "
+                        "'huge' with real headroom; 192 OOMs. Pass your own list to "
+                        "explore other sizes, e.g. on a smaller GPU).")
     p.add_argument('--grid_lrs', type=str, default=None,
-                   help="GRID_SEARCH: comma-separated learning rates, e.g. '1e-4,3e-4' "
-                        "(default: 1e-4,3e-4).")
+                   help="GRID_SEARCH: comma-separated learning rates, e.g. "
+                        "'8e-4,1e-3,1.2e-3' (default: 1e-3,1.2e-3,1.6e-3 - extends "
+                        "upward from the prior sweep's 8e-4, which beat 4e-4 at bs128 "
+                        "and was still the top of the tested range, toward the "
+                        "linear-scaling-rule prediction of ~1.2e-3 for bs128 off "
+                        "Config.lr=3e-4 @ bs=32).")
     p.add_argument('--grid_model_sizes', type=str, default=None,
-                   help="GRID_SEARCH: comma-separated model sizes, e.g. 'base,deep' "
-                        "(default: all of tiny,small,base,deep,deeper,huge).")
+                   help="GRID_SEARCH: comma-separated model sizes, e.g. 'huge,very_deep' "
+                        "(default: huge - it beat very_deep at every batch_size x lr "
+                        "point in the Aug 2026 sweep despite very_deep's extra layers).")
+    p.add_argument('--no_grid_final_train', action='store_true',
+                   help="GRID_SEARCH: after ranking combos on the (usually subsampled) "
+                        "sweep, the winner is automatically retrained on the FULL "
+                        "dataset for --grid_final_epoch_multiplier x --epochs epochs - "
+                        "one command does screening AND produces the real deliverable. "
+                        "Pass this to skip that and just get the leaderboard.")
+    p.add_argument('--grid_final_epoch_multiplier', type=int, default=10,
+                   help="GRID_SEARCH: epoch multiplier for the automatic final full-data "
+                        "training pass (default 10x --epochs). E.g. --epochs 5 sweeps at "
+                        "5 epochs/combo, then trains the winner for 50 epochs on all the "
+                        "data. NOTE this multiplies against the FULL dataset while the "
+                        "sweep ran on --data_fraction of it, so at --epochs 20 the final "
+                        "pass alone costs ~5x the entire sweep - lower it if that is more "
+                        "than you meant to spend.")
+    p.add_argument('--grid_final_run_name', default=None,
+                   help="GRID_SEARCH: run_name for the automatic final training pass "
+                        "(default: '<run_name>_final').")
     p.add_argument('--data_fraction', type=float, default=None,
                    help='TRAIN / GRID_SEARCH: cap training-data usage to this fraction '
                         '(0.0–1.0) of the whole (+augmented) training set - a random '
@@ -2534,7 +3464,25 @@ def main():
                    help='override num_layers from the chosen preset (advanced)')
     p.add_argument('--dropout', type=float, default=None,
                    help='override dropout from the chosen preset (advanced)')
+    p.add_argument('--max_seq_len', type=int, default=None,
+                   help='TRAIN: notes per training window; EVERY sample is padded to this '
+                        'length, so an oversized value burns compute on padding - attention '
+                        'is O(n^2), so 4x too long is ~16x the attention work. Match it to '
+                        'your actual note counts (the cache build prints them). Samples '
+                        'longer than this are randomly cropped during training and chunked '
+                        'with overlap at inference, so a smaller value is safe, not lossy. '
+                        'Also sets the positional-embedding size, so it is baked into the '
+                        'checkpoint and re-read automatically at infer time.')
     p.add_argument('--num_workers', type=int, default=None)
+    p.add_argument('--print_every', type=int, default=None,
+                   help='TRAIN: refresh the live batch-progress display every N '
+                        'batches, in-place (default 15; the last 3 batches of each '
+                        'epoch always refresh). 1 = every batch.')
+    p.add_argument('--no_tensorboard', action='store_true',
+                   help='TRAIN / GRID_SEARCH: disable TensorBoard logging (on by default '
+                        'when the tensorboard package is installed). Logs go to '
+                        "checkpoints/<run_name>/tb - view with: "
+                        "tensorboard --logdir checkpoints")
     p.add_argument('--velocity_bins', type=int, default=None,
                    help='128=lossless (1 MIDI-vel/bin), 64=Δ2, 32=Δ4. '
                         'Must match between cache-build and train.')
@@ -2671,6 +3619,18 @@ def main():
                         '0 = hard one-hot.')
     args = p.parse_args()
 
+    # DESIGN: printed immediately, before any of the slow/silent steps below (cache
+    # pickle.load of a multi-GB file, MIDI scanning, model build), so a GPU-vs-CPU
+    # question never depends on watching a long training preamble first, and so the
+    # terminal shows SOMETHING right after argparse instead of going quiet.
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}  (CUDA available - will train on GPU)")
+    else:
+        print("GPU: none detected - training will run on CPU (slow). "
+              "If you have an NVIDIA GPU, check that torch was installed with CUDA "
+              "support: python -c \"import torch; print(torch.__version__)\" should "
+              "show a '+cuXXX' suffix, not '+cpu'.")
+
     cfg = Config()
     def apply_overrides(c):
         # 1) whole-model preset first (sets d_model/nhead/num_layers/dim_ff/dropout)
@@ -2683,7 +3643,9 @@ def main():
         if args.d_model is not None:       c.d_model = args.d_model
         if args.num_layers is not None:    c.num_layers = args.num_layers
         if args.dropout is not None:       c.dropout = args.dropout
+        if args.max_seq_len is not None:   c.max_seq_len = args.max_seq_len
         if args.num_workers is not None:   c.num_workers = args.num_workers
+        if args.print_every is not None:   c.print_every = args.print_every
         if args.target_mode is not None:   c.target_mode = args.target_mode
         if args.vel_soft_sigma is not None: c.vel_soft_sigma = args.vel_soft_sigma
         if args.off_soft_sigma is not None: c.off_soft_sigma = args.off_soft_sigma
@@ -2741,9 +3703,17 @@ def main():
         if not os.path.exists(args.cache):
             print(f"Cache not found: {args.cache}. Run --mode cache first, or use --synthetic.")
             sys.exit(1)
+        # DESIGN: a real-library cache is a few GB, and pickle.load has no built-in way
+        # to report progress - unpickling it is a single blocking call that otherwise
+        # leaves the terminal silent for tens of seconds with zero feedback, which reads
+        # as a hang. Print size before, elapsed after.
+        cache_mb = os.path.getsize(args.cache) / (1024 ** 2)
+        print(f"Loading cache: {args.cache} ({cache_mb:,.0f} MB)...", flush=True)
+        t_load = time.time()
         with open(args.cache, 'rb') as f:
             blob = pickle.load(f)
         samples = blob['samples']
+        print(f"Cache loaded: {len(samples):,} samples ({time.time() - t_load:.1f}s)")
         meta = blob.get('meta')
         saved = blob.get('cfg', {})
         cache_bins = saved.get('velocity_bins', 32)
@@ -2761,9 +3731,11 @@ def main():
                         or 'ts_ids' not in samples[0]['target']
                         or 'iois_same' not in samples[0]['target']
                         or 'tempo_norm' not in samples[0]['target']):
-            print("[*] Upgrading older cache with regression/pitch target arrays...")
+            print(f"[*] Upgrading {len(samples):,} older-cache samples with "
+                  f"regression/pitch target arrays...")
             tok = Tokenizer(cfg)
-            for s in samples:
+            it = tqdm.tqdm(samples, desc="Upgrading cache") if HAS_TQDM else samples
+            for s in it:
                 ev = s.get('events')
                 if ev is not None:
                     s['target'] = tok.events_to_arrays(ev)
@@ -2773,7 +3745,8 @@ def main():
     if args.mode == 'train':
         cfg, samples, train_meta = _load_training_data(cfg)
         train(cfg, samples, args.run_name, resume=args.resume, meta=train_meta,
-             data_fraction=args.data_fraction if args.data_fraction is not None else 1.0)
+             data_fraction=args.data_fraction if args.data_fraction is not None else 1.0,
+             use_tensorboard=not args.no_tensorboard)
 
     elif args.mode == 'grid_search':
         cfg, samples, train_meta = _load_training_data(cfg)
@@ -2782,11 +3755,25 @@ def main():
         ms_list = [x.strip() for x in args.grid_model_sizes.split(',')] if args.grid_model_sizes else None
         grid_search(cfg, samples, meta=train_meta,
                    batch_sizes=bs_list, lrs=lr_list, model_sizes=ms_list,
-                   run_prefix=args.run_name or "grid", data_fraction=args.data_fraction)
+                   run_prefix=args.run_name or "grid", data_fraction=args.data_fraction,
+                   use_tensorboard=not args.no_tensorboard,
+                   auto_final_train=not args.no_grid_final_train,
+                   final_epoch_multiplier=args.grid_final_epoch_multiplier,
+                   final_run_name=args.grid_final_run_name)
 
     elif args.mode == 'infer':
-        if not args.checkpoint or not args.input:
-            p.error("--checkpoint and --input are required for infer mode")
+        if not args.checkpoint:
+            if os.path.exists(DEFAULT_PRETRAINED_CHECKPOINT):
+                args.checkpoint = DEFAULT_PRETRAINED_CHECKPOINT
+                print(f"[note] no --checkpoint given - using the bundled pretrained "
+                      f"model at '{DEFAULT_PRETRAINED_CHECKPOINT}'")
+            else:
+                p.error(f"--checkpoint is required for infer mode (no bundled "
+                        f"pretrained model found at '{DEFAULT_PRETRAINED_CHECKPOINT}' "
+                        f"either - run --mode grid_search first, or pass --checkpoint "
+                        f"explicitly)")
+        if not args.input:
+            p.error("--input is required for infer mode")
         if args.model_size is not None:
             print(f"[note] --model_size is ignored at inference; the architecture "
                   f"is read from the checkpoint so it always matches training.")

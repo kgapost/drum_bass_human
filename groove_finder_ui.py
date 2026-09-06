@@ -683,6 +683,15 @@ class GrooveFinderApp:
         self.build_btn = ttk.Button(parent, text="Build Index", command=self._on_build_index)
         self.build_btn.pack(padx=8, pady=4, anchor='w')
 
+        # DESIGN: fsg.build_index() is a single blocking call with no per-file
+        # progress callback, so there is no real percentage to show - this is
+        # INDETERMINATE (the bouncing-block style), just proving the app is alive
+        # during what can be a long scan, not "X of Y files done". Hidden (packed
+        # away) until a build starts, so it doesn't clutter the tab at rest.
+        self.build_progress = ttk.Progressbar(parent, mode='indeterminate')
+        self.build_progress_note = ttk.Label(parent, text="", foreground='#0066cc',
+                                             wraplength=440, justify='left')
+
     def _on_browse_data_dir(self):
         path = filedialog.askdirectory(title="Select your MIDI library folder")
         if path:
@@ -712,7 +721,17 @@ class GrooveFinderApp:
             min_velocity_cymbals=self.var_build_min_vel_cymbals.get(),
         )
         self.build_btn.config(state='disabled')
-        self._set_status(f"Building index from '{data_dir}'...", busy=True)
+        # DESIGN: shown in the Build tab (so it's clear which folders THIS run is
+        # actually using, independent of whatever the entry fields get edited to
+        # while it's running) AND in the main status bar, since the Settings
+        # dialog can be closed while the build keeps running on its thread - the
+        # main window is the only place guaranteed to still be around to see it.
+        note = f"Building from:\n  {data_dir}\ninto:\n  {cache_path}"
+        self.build_progress_note.config(text=note)
+        self.build_progress_note.pack(padx=8, pady=(4, 0), anchor='w')
+        self.build_progress.pack(fill='x', padx=8, pady=(4, 8))
+        self.build_progress.start(12)
+        self._set_status(f"Building index from '{data_dir}' -> '{cache_path}'...", busy=True)
         threading.Thread(target=self._build_index_worker,
                          args=(data_dir, cache_path, cfg, self.var_build_workers.get()),
                          daemon=True).start()
@@ -720,14 +739,35 @@ class GrooveFinderApp:
     def _build_index_worker(self, data_dir, cache_path, cfg, num_workers):
         try:
             fsg.build_index(data_dir, cache_path, cfg, num_workers=num_workers)
-        except Exception as exc:
-            msg = _report_error(f"building index from '{data_dir}'", exc)
+        # DESIGN: fsg.build_index() calls sys.exit(1) itself on an empty/unusable
+        # library ("no usable MIDI files found") - that raises SystemExit, which
+        # `except Exception` does NOT catch (SystemExit is a BaseException, not an
+        # Exception). Uncaught, it silently kills just this background thread with
+        # no callback ever firing - the progress bar would spin forever, the build
+        # button would stay disabled, and there'd be no visible error at all.
+        except (Exception, SystemExit) as exc:
+            detail = (" (empty/unusable library - see the console output above for "
+                      "the exact reason: too few files, none parsed, etc.)"
+                      if isinstance(exc, SystemExit) else "")
+            msg = _report_error(f"building index from '{data_dir}'{detail}", exc)
             self.root.after(0, lambda: self._on_build_index_error(msg))
             return
         self.root.after(0, lambda: self._on_build_index_done(cache_path))
 
+    def _stop_build_progress(self):
+        # The Settings dialog (and everything in it, including these widgets) can
+        # be closed while the build thread is still running - guard every touch.
+        if self.build_btn.winfo_exists():
+            self.build_btn.config(state='normal')
+        if self.build_progress.winfo_exists():
+            self.build_progress.stop()
+            self.build_progress.pack_forget()
+        if self.build_progress_note.winfo_exists():
+            self.build_progress_note.pack_forget()
+            self.build_progress_note.config(text="")
+
     def _on_build_index_done(self, cache_path):
-        self.build_btn.config(state='normal')
+        self._stop_build_progress()
         self._set_status(f"Index built -> {cache_path}", busy=False)
         if messagebox.askyesno("Index built", f"Index built successfully:\n{cache_path}\n\n"
                                f"Load it now?"):
@@ -735,7 +775,7 @@ class GrooveFinderApp:
             threading.Thread(target=self._load_index_worker, args=(cache_path,), daemon=True).start()
 
     def _on_build_index_error(self, msg):
-        self.build_btn.config(state='normal')
+        self._stop_build_progress()
         messagebox.showerror("Failed to build index", msg)
         self._set_status("Failed to build index.", busy=False)
 

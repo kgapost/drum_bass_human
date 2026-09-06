@@ -5,3 +5,4 @@ python-rtmidi
 torch
 tqdm
 tkinterdnd2
+tensorboard

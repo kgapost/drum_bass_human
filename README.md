@@ -31,46 +31,82 @@ source dbh/bin/activate
 pip install -r requirements.txt
 ```
 
+or
+
+```bash
+python3 -m venv dbh
+dbh\Scripts\activate.bat
+pip install -r requirements.txt
+```
+
+
+
 Note: `tkinter` (needed by `groove_finder_ui.py` and `drum_bass_studio.py`) is
 not in requirements.txt - it's not pip-installable, comes from the system.
 On Linux, if `import tkinter` fails: `sudo apt install python3-tk`.
+On Windows, the official python.org installer (and `winget install
+Python.Python.3.12`) bundles Tcl/Tk by default, so `tkinter` just works out of
+the box - no separate install step. (Only exception: Python from the
+Microsoft Store excludes it: reinstall via python.org/winget with the "tcl/tk
+and IDLE" optional feature checked.)
 
-## 2. drum_humanizer_v3.py - build cache -> train -> infer
+## 2. drum_theme_segmentation.py - dataset -> train -> infer
+```bash
+# a) build the (synthetic) training dataset from a MIDI library
+python drum_theme_segmentation.py --mode dataset --data_dir ./data --cache ./cache/segments.pkl --num_samples 1000
+
+# b) train
+python drum_theme_segmentation.py --mode train --cache ./cache/segments.pkl --run_name seg_v1 --epochs 100 --windows_per_sample 8
+
+# c) run on a real song, print predicted boundary measures
+#    (use the threshold the training run's sweep recommended, not necessarily 0.5)
+python drum_theme_segmentation.py --mode infer --checkpoint ./checkpoints/seg_v1/best.pt --input my_song.mid --threshold 0.5
+```
+
+### Getting a decent val_F1 out of the segmentation model
+
+The knobs that actually moved the needle, roughly in order of payoff:
+
+| Flag | Why it matters |
+|---|---|
+| `--windows_per_sample` (default 8) | A cached sample averages ~9k notes but one window only covers `--max_seq_len` of them, so it takes ~17 windows to tile one sample. At the old fixed 1-window-per-sample the model saw **~5% of the cache per epoch** - it was data-*starved*, not data-poor. This is free extra training signal: no cache rebuild, no extra disk. |
+| `--epochs` / `--early_stop_patience` (default 15) | `OneCycleLR` anneals the LR across *all* `--epochs`, and most of the final gain is in that low-LR tail. Too-tight patience kills the run mid-schedule (seen: stopped at epoch ~50/100 with lr still at 2.2e-4, only 28% into the decay). Set `--epochs` to what you actually intend to run. |
+| `--max_seq_len` (default 512) / `--batch_size` | To call a bar a boundary the model has to compare it against the **previous theme block**. At 512 notes a window spans only ~2x one block, so near a boundary it often sees just a fragment of what came before. 1024 gives ~4 blocks of context - but attention is O(n^2), so drop `--batch_size` to 8 alongside it on a 4GB card. |
+| `--d_model` / `--num_layers` | Defaults (128 / 3) are ~500k params and epochs take seconds on a GPU. Plenty of headroom to go to 256 / 6. |
+| `--num_samples` (dataset mode) | Only worth raising *after* the above - window coverage is the cheaper lever. Costs ~240MB of cache per 1000 samples. Whether more samples add genuinely new material depends on how many name-families your library has: the dataset step prints this (a large library can have tens of thousands, in which case there is a lot left to draw on). |
+| `--pos_weight` (default 8.0) | Class-imbalance weight. Compare it against the real imbalance - if training shows precision **below** recall the model is over-predicting, so lower it. |
+
+Every training run ends with a **validation threshold sweep** over the best
+checkpoint. `val_F1` during training is scored at a fixed 0.5 cutoff, which is
+rarely the F1-optimal operating point when positives are rare (~1 boundary per
+17 measure-start notes) - the sweep reports the threshold that actually
+maximizes F1, and that is the number to pass to `--threshold` at infer time.
+
+
+## 3. drum_humanizer_v3.py - build cache -> train -> infer
 ```bash
 # build a training cache from a folder of MIDI files (once)
-python drum_humanizer_v3.py --mode cache --data_dir "/path/to/SD3/MIDI" --cache cache/samples.pkl
+python drum_humanizer_v3.py --mode cache --data_dir "./data" --cache ./cache/samples.pkl
 
-# train a model on that cache
-python drum_humanizer_v3.py --mode train --cache cache/samples.pkl --run_name sd3_v1 --epochs 100
+# train a model on that cache (--model_size small - see the size-tradeoff note below
+# for why: 2.2x faster than the 'base' default at a real capacity cost, benchmarked)
+python drum_humanizer_v3.py --mode train --cache cache/samples.pkl --run_name v1 --model_size small --epochs 100
 
 # quick smoke test with no real data:
 python drum_humanizer_v3.py --mode train --synthetic --epochs 3 --run_name smoke
 
 # humanize a loop with the trained checkpoint
-python drum_humanizer_v3.py --mode infer --checkpoint checkpoints/sd3_v1/best.pt --input my_loop.mid --output my_loop_human.mid --strength 0.85
+python drum_humanizer_v3.py --mode infer --checkpoint checkpoints/v1/best.pt --input my_loop.mid --output my_loop_human.mid --strength 0.85
 ```
 
-## 3. drum_theme_segmentation.py - dataset -> train -> infer
 
-```bash
-# a) build the (synthetic) training dataset from a MIDI library
-python drum_theme_segmentation.py --mode dataset --data_dir "/path/to/MIDI" --cache cache/segments.pkl --num_samples 300
-
-# b) train
-python drum_theme_segmentation.py --mode train --cache cache/segments.pkl \
-       --run_name seg_v1 --epochs 40
-
-# c) run on a real song, print predicted boundary measures
-python drum_theme_segmentation.py --mode infer --checkpoint checkpoints/seg_v1/best.pt \
-       --input my_song.mid --threshold 0.5
-```
 
 ## 4. find_similar_grooves.py - index -> query
 
 ```bash
 # a) index your MIDI library once
-python find_similar_grooves.py --mode index --data_dir "/path/to/MIDI" \
-       --cache cache/groove_index.pkl
+python find_similar_grooves.py --mode index --data_dir ./data \
+       --cache ./cache/groove_index.pkl
 
 # b) query: rank the library against one groove
 python find_similar_grooves.py --mode query --cache cache/groove_index.pkl \
@@ -239,15 +275,99 @@ output before adding `--execute`.
   with `--mode index` again - a `--mode query` re-run won't pick up the change.
 
 **Other things worth remembering:**
-- `--synthetic` (on both `drum_humanizer_v3.py` and effectively via
-  `--num_samples` on `drum_theme_segmentation.py`) lets me smoke-test training
+- `--synthetic` on `drum_humanizer_v3.py` lets me smoke-test training
   end-to-end with fake data, no MIDI library needed - useful to sanity check
-  a code change before waiting on a real cache build.
+  a code change before waiting on a real cache build. `drum_theme_segmentation.py`
+  has no `--synthetic` equivalent (its whole dataset is already synthesized from
+  real loops, so it always needs a library); the fast-iteration knob there is a
+  small `--num_samples` for a quick cache plus a low `--epochs`. Don't mistake
+  a small `--num_samples` for the quality knob - see the segmentation tuning
+  table above for what actually moves val_F1.
 - `drum_humanizer_v3.py` also has a hidden `--mode grid_search` (not shown in
   its own usage examples) for sweeping `--grid_batch_sizes` /
   `--grid_model_sizes` / `--grid_lrs` combos.
 - `--resume <checkpoint>` on both trainers continues training from a saved
   checkpoint instead of starting over.
+- **`--max_seq_len` is a compute knob, not just a ceiling - and an oversized one
+  is catastrophic on a small card.** EVERY sample is padded to it, and attention
+  is O(n^2). Measured on a 166k-sample library: median sample is **38 notes**,
+  p95 is 176, and only 0.10% exceed 1024 - so the old 1024 default made **93.9%
+  of every batch pure padding** (16x wasted work in the linear layers, 123x in
+  attention). Worse, at `max_seq_len=1024 --batch_size 32` the activations need
+  ~15.5GB; on a 4GB card Windows WDDM does not hard-OOM, it silently spills to
+  system RAM over PCIe, so training still "runs" - at 17 seconds per batch, with
+  `nvidia-smi` showing a misleading 100% GPU utilization (thrashing, not math).
+  Benchmarked on a GTX 1650:
+
+  | `max_seq_len` / `batch_size` | s/batch | samples/s | peak VRAM |
+  |---|---|---|---|
+  | 1024 / 32 (old default) | 17.11 | 2 | 15,563 MB |
+  | **256 / 32 (new default)** | **1.18** | **27** | **1,557 MB** |
+  | 192 / 32 | 0.88 | 36 | 1,044 MB |
+  | 128 / 64 | 1.02 | 63 | 1,153 MB |
+
+  Coverage tradeoff: 256 leaves 98.5% of samples uncropped, 192 leaves 96.2%,
+  128 only 88%. Samples longer than the window are randomly cropped in training
+  and chunked with overlap-blending at inference, so a smaller value is a speed
+  win rather than a quality loss - until the crop rate gets high enough to start
+  truncating real phrases. **The value is baked into the cache**, so an existing
+  cache keeps its old one: pass `--max_seq_len 256` explicitly, or rebuild.
+- **`--model_size` (`tiny`/`small`/`base`/`deep`/`deeper`/`huge`) is a real speed
+  lever, not just a quality knob - and the payoff drops off fast past `small`.**
+  Benchmarked on a GTX 1650 at `--batch_size 8 --max_seq_len 256` (with the SDPA
+  attention fusion in place):
+
+  | size | params | ms/batch | samples/s | vs `base` | peak VRAM |
+  |---|---|---|---|---|---|
+  | tiny | 0.9M | 55 | 145.2 | 4.94x faster | 98MB |
+  | **small** | **2.4M** | **124** | **64.6** | **2.20x faster** | **178MB** |
+  | base (default) | 5.8M | 272 | 29.4 | 1.00x | 326MB |
+  | deep | 13.9M | 620 | 12.9 | 0.44x | 638MB |
+  | deeper | 27.1M | 1205 | 6.6 | 0.23x | 1062MB |
+  | very_deep | 37.7M | (not benchmarked on the 1650) | - | - | - |
+  | huge | 60.6M | 2678 | 3.0 | 0.10x | 1871MB |
+
+  **`very_deep` is DEPTH-first, and deliberately not just "bigger".** It is the only
+  preset that goes *deeper* than `huge` (20 layers vs 18) while staying *narrower*
+  (d_model 384 vs 512), so it costs ~37.7M params instead of ~60.6M. The reasoning,
+  from this library's own measurements: ~166k section-samples hold only ~10.4M
+  supervised note-events (median 38 notes/sample), and a real sweep put `base`
+  (5.8M) at val_loss 8.2999 against `deep` (13.9M) at 8.2949 - a 0.006 gap, i.e.
+  noise. Capacity was not the binding constraint, so extra *width* (params grow
+  ~quadratically in d_model) mostly buys overfitting; extra *depth* buys more
+  rounds of relating distant hits at only ~linear param cost, which is what
+  "is this a build / is this the bar before a fill" actually needs. Dropout rises
+  to 0.25 to match. **Be honest about the odds though: the same evidence that
+  motivates the shape also predicts it may not beat `deep` at all** - it is worth
+  one sweep slot, not a default choice, and it is the most expensive combo in any
+  grid it appears in.
+
+  `small` is the pick used above: more than 2x faster than `base` while staying
+  the same order of magnitude in parameters (unlike `tiny`, which is a genuinely
+  smaller model at 16% of `base`'s capacity - nearly 5x faster, but a real
+  capacity cut, not just a speed one). VRAM is not the constraint at ANY of these
+  sizes on a 4GB card at this batch size - if a smaller model isn't warranted,
+  raising `--batch_size` is a separate, still-available lever. Whether `small`'s
+  humanization actually sounds as good as `base`'s is a quality question this
+  benchmark can't answer - only listening to real output can.
+- **Big cache + DataLoader workers on Windows = MemoryError before the first
+  batch.** Windows/macOS start workers by `spawn`, so every worker gets a full
+  *pickled copy* of the dataset, and the parent has to build that whole pickle
+  buffer in RAM to hand over. Train and val each spawn `--num_workers`, so the
+  real cost is about `(2*num_workers + 1)` x the cache. A 2.5GB cache with
+  `--num_workers 4` projects to ~21GB and dies inside `w.start()` with a
+  traceback pointing at `multiprocessing/reduction.py`, not at the real cause.
+  Both trainers now measure this up front and fall back to `num_workers=0`
+  (main-process loading, no pickling, no copies) with a printed explanation.
+  `__getitem__` is numpy slicing in both, so workers were buying little anyway.
+  Set `DBH_FORCE_WORKERS=1` to keep the configured count regardless. Linux
+  `fork` shares those pages copy-on-write and is never downgraded.
+- `drum_theme_segmentation.py`'s **validation windows are deterministic** (fixed,
+  evenly-spaced crops) while training windows are random. This is deliberate: a
+  `val_F1` measured on a different random slice each epoch isn't comparable
+  epoch-to-epoch, which silently corrupts both "new best" checkpoint selection
+  and early stopping (they end up reacting to sampling noise instead of to the
+  model). Don't "simplify" the val loader back to random crops.
 - `find_similar_grooves.py --mode query --exclude_same_family` filters out
   results whose filename is just a near-duplicate/variation of the query
   (e.g. "Fill 1" vs "Fill 14") - useful when the top match is trivially the
@@ -260,10 +380,58 @@ output before adding `--execute`.
   fine to retune by feel) vs. `VERIFIED FINDING` / `HARD TECHNICAL CONSTRAINT`
   (derived from something real - don't casually change without re-checking
   why it's there).
-- This machine has no NVIDIA GPU (`torch.cuda.is_available()` is `False` -
-  Intel iGPU only), so training runs on CPU. Works, just slow - budget more
-  time for `--mode train` runs than a CUDA box would need.
+- All training/inference entry points already auto-select the best available
+  device (`cuda` -> `mps` -> `cpu`), so nothing needs to be passed to use a
+  GPU - it just happens if `torch.cuda.is_available()` is `True`.
+- `pip install -r requirements.txt` installs a **CPU-only** `torch` by
+  default. On an NVIDIA-GPU machine, install the CUDA build instead (match
+  the CUDA version to your driver - check with `nvidia-smi`, then see
+  https://pytorch.org/get-started/locally/ for the right `--index-url`), e.g.:
+  ```bash
+  pip install torch==2.13.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+  ```
+  Verify it took with `python -c "import torch; print(torch.cuda.is_available())"`.
+  On a 4GB-class card, drop `--batch_size` if training hits a CUDA
+  out-of-memory error.
 - The `dbh` venv is set as this workspace's default interpreter (see
   `drum_bass_human.code-workspace`), so a fresh VS Code terminal should
   already have it active - no need to `source dbh/bin/activate` manually
   unless running from a plain shell outside VS Code.
+
+```bash
+dbh\Scripts\activate.bat
+
+tensorboard --logdir checkpoints
+http://localhost:6006
+
+python drum_theme_segmentation.py --mode dataset --data_dir ./data --cache ./cache/segments.pkl --num_samples 15000
+python drum_theme_segmentation.py --mode train --cache ./cache/segments.pkl --run_name seg_model --epochs 100 --windows_per_sample 8
+
+python drum_humanizer_v3.py --mode cache --data_dir "./data" --cache ./cache/samples.pkl
+python drum_humanizer_v3.py --mode train --cache cache/samples.pkl --run_name humanizer_final_v1 --model_size deep --batch_size 32 --lr 1.5e-4 --data_fraction 1.0 --epochs 100
+
+python drum_humanizer_v3.py --mode grid_search --cache cache/samples.pkl --run_name grid --grid_model_sizes base,deep --grid_batch_sizes 32,16 --grid_lrs 7.5e-5,1.5e-4 --data_fraction 0.1 --epochs 3
+
+
+```
+
+## 7. Fresh setup on a new Ubuntu machine
+
+```bash
+python3 -m venv dbh
+source dbh/bin/activate
+pip install -r requirements.txt
+
+pip install torch==2.13.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+
+python drum_humanizer_v3.py --mode cache --data_dir ./data --cache cache/samples.pkl --hop_bars 16 --section_bars 16
+
+python drum_humanizer_v3.py --mode grid_search --cache cache/samples.pkl --run_name grid --grid_model_sizes huge,very_deep --grid_batch_sizes 128,64 --grid_lrs 8e-4,4e-4 --data_fraction 0.25 --epochs 20 --grid_final_epoch_multiplier 5
+
+```
+
+
+
+
+

@@ -1,6 +1,7 @@
 dbh/
 venv/
 .venv/
+data/
 __pycache__/
 *.pyc
 cache/
@@ -9,3 +10,5 @@ checkpoints/
 .claude/
 *.code-workspace
 .DS_Store
+pretrained/
+groove_finder_settings.json

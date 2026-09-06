@@ -104,6 +104,7 @@ import pickle
 import difflib
 import argparse
 import traceback
+from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -215,6 +216,38 @@ DRUM_CLASS_NAMES = {
     10: "China/Splash", 11: "Perc", 12: "Other",
 }
 
+# DESIGN: mirrors drum_theme_segmentation.py's/drum_humanizer_v3.py's drum-track
+# selection heuristic, duplicated here (not imported) to keep this file self-
+# contained per the GM_DRUM_MAP comment above. A DAW export - a purchased/
+# downloaded drum-groove pack, or e.g. Reaper's default "export track MIDI",
+# which keeps whatever channel the track happened to be on rather than forcing
+# channel 10 - routinely isn't on GM channel 10, so relying on pretty_midi's
+# is_drum flag alone silently treats a huge fraction of a real library as
+# unparseable (observed: 89% of a real 194,819-file library skipped before this
+# fallback existed here). Keep in sync with the other two files by hand if this
+# heuristic ever changes.
+_DRUM_NAME_RE = re.compile(r'drum|kit|perc|groove|beat', re.IGNORECASE)
+_NON_DRUM_NAME_RE = re.compile(
+    r'bass|guitar|piano|keys?|synth|vocal|lead|pad|string|brass|horn|organ|choir', re.IGNORECASE)
+
+
+def _select_drum_notes(midi):
+    """Returns (notes, source) - source is 'channel10', 'single_track_fallback',
+    'name_match_fallback', 'ambiguous_multi_track', or 'no_notes'."""
+    drum_tracks = [t for t in midi.instruments if t.is_drum]
+    if drum_tracks:
+        return [n for t in drum_tracks for n in t.notes], 'channel10'
+    non_empty = [t for t in midi.instruments if t.notes]
+    if not non_empty:
+        return [], 'no_notes'
+    if len(non_empty) == 1:
+        return list(non_empty[0].notes), 'single_track_fallback'
+    named_drum = [t for t in non_empty
+                  if _DRUM_NAME_RE.search(t.name or '') and not _NON_DRUM_NAME_RE.search(t.name or '')]
+    if named_drum:
+        return [n for t in named_drum for n in t.notes], 'name_match_fallback'
+    return [], 'ambiguous_multi_track'
+
 # ── Articulation-flattening groups for the optional pattern components ──────────
 # DESIGN: "does the hi-hat pattern feel the same" should be TRUE even if one
 # groove plays it all-closed and another opens the hat for an accent - that's
@@ -257,7 +290,7 @@ def _passes_velocity_floor(inst: int, velocity: int, cfg: Config) -> bool:
 
 def _extract_fingerprint_impl(path: str, cfg: Config) -> Optional[Dict]:
     midi = pretty_midi.PrettyMIDI(path)
-    notes = [n for t in midi.instruments if t.is_drum for n in t.notes]
+    notes, note_source = _select_drum_notes(midi)
     if len(notes) < cfg.min_notes:
         return None
     tempo = 120.0
@@ -345,6 +378,7 @@ def _extract_fingerprint_impl(path: str, cfg: Config) -> Optional[Dict]:
         'n_bars': int(n_bars),
         'n_notes': int(used_notes),
         'instruments_used': sorted(set(GM_DRUM_MAP.get(n.pitch, -1) for n in notes) - {-1}),
+        'note_source': note_source,
     }
 
 
@@ -433,6 +467,7 @@ def build_index(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
     density_vec  = np.zeros(N, dtype=np.float32)
     tempo_vec    = np.zeros(N, dtype=np.float32)
     meta = []
+    note_sources = Counter()
     for i, p in enumerate(idx_paths):
         fp = fingerprints[p]
         rhythm_mat[i] = fp['rhythm']
@@ -445,6 +480,15 @@ def build_index(data_dir: str, cache_path: str, cfg: Config, num_workers: int = 
         meta.append({'n_bars': fp['n_bars'], 'n_notes': fp['n_notes'],
                      'instruments_used': fp['instruments_used'],
                      'family': normalize_basename(p)})
+        note_sources[fp.get('note_source', 'channel10')] += 1
+
+    fallback = note_sources.get('single_track_fallback', 0) + note_sources.get('name_match_fallback', 0)
+    if fallback:
+        print(f"  Recovered via non-channel-10 fallback: {fallback} files "
+              f"({note_sources.get('single_track_fallback', 0)} single-track, "
+              f"{note_sources.get('name_match_fallback', 0)} name-matched) "
+              f"- see _select_drum_notes for the heuristic; spot-check a few if this "
+              f"number looks off.")
 
     os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
     with open(cache_path, 'wb') as f:

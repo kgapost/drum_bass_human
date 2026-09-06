@@ -511,7 +511,20 @@ class StudioApp:
         self.playing_path: Optional[str] = None
 
         self._build_widgets()
+        self._load_default_pretrained()
         self._refresh_gating()
+
+    def _load_default_pretrained(self):
+        """Auto-select the bundled pretrained/humanizer_best.pt, if present, so the
+        app is usable without a manual 'Load...' click. Still fully overridable -
+        this only sets the same state a manual Load does."""
+        if not HAS_HUMANIZER:
+            return
+        path = dhu.DEFAULT_PRETRAINED_CHECKPOINT
+        if os.path.exists(path):
+            self.hum_checkpoint_path = path
+            self.hum_model_label.config(text=f"{os.path.basename(path)} (bundled default)",
+                                        foreground='black')
 
     # ------------------------------------------------------------------ UI --
     def _build_widgets(self):

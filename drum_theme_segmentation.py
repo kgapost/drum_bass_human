@@ -80,6 +80,7 @@ import random
 import difflib
 import argparse
 import traceback
+import multiprocessing
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -210,7 +211,20 @@ class Config:
     warmup_pct:       float = 0.1
     grad_clip:        float = 1.0
     val_split:        float = 0.1
-    early_stop_patience: int = 8
+    # DESIGN: a cached sample averages ~9k notes but one training window only covers
+    # max_seq_len (512) of them, so drawing a single crop per sample per epoch showed
+    # the model ~5% of the cache per epoch - it was data-STARVED, not data-poor.
+    # Drawing N crops per sample instead multiplies the training signal at zero extra
+    # cache size or build time. ~17 windows tile one average sample; 8 is a good
+    # coverage/epoch-time tradeoff. Raise toward 16 if the GPU is idle-waiting.
+    windows_per_sample: int = 8
+    # DESIGN: raised from 8. OneCycleLR anneals the LR across ALL max_epochs, and most
+    # of the final gain lands in that low-LR tail - stopping at the first 8-epoch
+    # plateau routinely kills a run while the LR is still near peak (observed: stopped
+    # at epoch ~50/100 with lr still at 2.2e-4, i.e. 28% into the decay). Patience must
+    # be loose enough to let the schedule finish, or --epochs must match the real
+    # intended run length.
+    early_stop_patience: int = 15
     num_workers:      int = 2
     pos_weight:       float = 8.0    # class-imbalance weight for the rare positive class
 
@@ -571,7 +585,18 @@ def build_training_samples(families: Dict, cfg: Config, num_samples: int,
     rng = random.Random(seed)
     samples = []
     shown = 0
-    for i in range(num_samples):
+    # DESIGN: this loop is single-threaded (each sample depends on rng state from the
+    # previous one, so it can't trivially parallelize across processes the way
+    # scan_theme_files does) and used to print NOTHING between the first
+    # verbose_examples and the final "Built N/M" line - at a large --num_samples (each
+    # sample can be thousands of NoteEvents) that reads as a hang for a very long time
+    # with zero feedback. tqdm mirrors the progress-bar pattern scan_theme_files
+    # already uses; the plain-print fallback keeps this working with tqdm absent.
+    it = range(num_samples)
+    if HAS_TQDM:
+        it = tqdm.tqdm(it, desc="Building samples", unit="sample")
+    t0 = time.time()
+    for i in it:
         events = build_one_sample(families, cfg, rng)
         if events is None:
             continue
@@ -581,9 +606,12 @@ def build_training_samples(families: Dict, cfg: Config, num_samples: int,
         samples.append({'arrays': arr, 'length': len(events),
                         'n_bars': n_bars, 'n_boundaries': n_boundary_bars})
         if shown < verbose_examples:
-            print(f"  sample {i}: {len(events)} notes, {n_bars} bars, "
-                  f"{n_boundary_bars} true theme boundaries")
+            line = (f"  sample {i}: {len(events)} notes, {n_bars} bars, "
+                   f"{n_boundary_bars} true theme boundaries")
+            tqdm.tqdm.write(line) if HAS_TQDM else print(line)
             shown += 1
+        elif not HAS_TQDM and (i + 1) % 200 == 0:
+            print(f"  ...{i+1}/{num_samples} samples built  ({time.time()-t0:.0f}s)")
     print(f"\nBuilt {len(samples)}/{num_samples} training samples "
           f"(some may be skipped if too few dissimilar theme families exist).")
     return samples
@@ -614,16 +642,37 @@ def build_cache(data_dir: str, cache_path: str, cfg: Config, num_samples: int, n
 class SegDataset(Dataset):
     """
     Windows each long synthetic sample down to cfg.max_seq_len notes per training
-    step (a random crop each call - different context each epoch). Labels are
-    per-note and window-crop-invariant (a note's boundary status doesn't depend on
-    where the window starts), so cropping never corrupts the target.
+    step. Labels are per-note and window-crop-invariant (a note's boundary status
+    doesn't depend on where the window starts), so cropping never corrupts the target.
+
+    windows_per_sample: how many crops each sample contributes per epoch. A cached
+    sample averages ~9k notes, so at max_seq_len=512 a SINGLE crop exposes only ~6%
+    of it - raising this is the cheapest way to actually train on the data already
+    sitting in the cache (no rebuild, no extra disk).
+
+    deterministic: TRAIN uses random crops (fresh context every epoch, acts as
+    augmentation). VALIDATION must NOT - a val_F1 measured on a different random
+    slice each epoch is not comparable epoch-to-epoch, which both corrupts "new best"
+    checkpoint selection and makes early stopping fire on sampling noise rather than
+    on a real plateau. Deterministic mode tiles each sample at fixed, evenly-spaced
+    offsets, so val_F1 moves only when the MODEL changes.
     """
-    def __init__(self, samples: List[Dict], cfg: Config):
+    def __init__(self, samples: List[Dict], cfg: Config,
+                 windows_per_sample: int = 1, deterministic: bool = False):
         self.samples = samples
         self.cfg = cfg
+        self.windows_per_sample = max(1, windows_per_sample)
+        self.deterministic = deterministic
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) * self.windows_per_sample
+
+    def _window_start(self, window_idx: int, n: int, L: int) -> int:
+        if not self.deterministic:
+            return random.randint(0, n - L)
+        if self.windows_per_sample == 1:
+            return (n - L) // 2                     # centre crop
+        return (window_idx * (n - L)) // (self.windows_per_sample - 1)
 
     def _window(self, arr, start, length):
         return {k: v[start:start + length] for k, v in arr.items()}
@@ -640,12 +689,12 @@ class SegDataset(Dataset):
         return out
 
     def __getitem__(self, idx):
-        arr = self.samples[idx]['arrays']
+        sample_idx, window_idx = divmod(idx, self.windows_per_sample)
+        arr = self.samples[sample_idx]['arrays']
         L = self.cfg.max_seq_len
         n = len(arr['instruments'])
         if n > L:
-            start = random.randint(0, n - L)
-            arr = self._window(arr, start, L)
+            arr = self._window(arr, self._window_start(window_idx, n, L), L)
         arr = self._pad(arr, L)
 
         pad_mask = torch.tensor(arr['instruments'] < 0, dtype=torch.bool)
@@ -663,21 +712,98 @@ class SegDataset(Dataset):
         }
 
 
+# DESIGN: bytes of dataset we're willing to copy into EACH DataLoader worker on a
+# 'spawn' platform before deciding workers aren't worth it. Kept in sync by hand with
+# drum_humanizer_v3.py's copy of this guard (these two files are deliberately
+# self-contained - see the GM_DRUM_MAP note).
+_SPAWN_WORKER_BUDGET = 1024 ** 3
+
+
+def _estimate_pickle_bytes(samples, probe: int = 256) -> int:
+    """
+    Size of the pickle buffer this sample list would produce, extrapolated from a prefix.
+
+    DESIGN: measures pickle.dumps() rather than summing ndarray.nbytes, because the raw
+    payload is NOT the dominant cost. Each sample holds several arrays, so a large cache
+    carries millions of tiny objects whose pickle framing roughly DOUBLES the array bytes
+    - measured on the humanizer's cache: 1.26GB of ndarray payload serialized to a 2.5GB
+    pickle. Summing nbytes therefore under-reports by ~2x and would let the guard below
+    sail past exactly the caches that blow up. The pickle buffer is also the thing the
+    parent actually has to materialize in RAM per worker, so it's the honest number.
+    """
+    if not samples:
+        return 0
+    head = samples[:probe]
+    return int(len(pickle.dumps(head, protocol=4)) / len(head) * len(samples))
+
+
+def _resolve_num_workers(samples, cfg: Config) -> int:
+    """
+    DESIGN: on 'spawn' platforms (Windows, macOS) every DataLoader worker receives a
+    full PICKLED COPY of the Dataset, and the parent must materialize that whole pickle
+    buffer in RAM to hand it over. train and val each spawn cfg.num_workers, so the real
+    cost is roughly (2*num_workers + 1)x the sample list, and a large cache MemoryErrors
+    inside w.start() before the first batch exists. Linux 'fork' shares those pages
+    copy-on-write and is unaffected.
+
+    Note this scales with --num_samples: a cache big enough to train well is exactly the
+    cache big enough to trip this. num_workers=0 loads in the main process - no pickling,
+    no IPC, no copies. Set DBH_FORCE_WORKERS=1 to keep the configured count regardless.
+    """
+    workers = max(0, cfg.num_workers)
+    if workers == 0 or not samples:
+        return workers
+    # get_start_method(allow_none=True) returns None until a context is actually fixed,
+    # which is the normal state here - so infer the platform default rather than treating
+    # "not yet decided" as spawn (that would wrongly downgrade fork platforms). Not using
+    # allow_none=False because that FIXES the start method as a side effect.
+    method = multiprocessing.get_start_method(allow_none=True)
+    if method is None:
+        method = 'fork' if sys.platform.startswith(('linux', 'freebsd')) else 'spawn'
+    if method == 'fork':
+        return workers
+    if os.environ.get('DBH_FORCE_WORKERS'):
+        return workers
+    est = _estimate_pickle_bytes(samples)
+    if est <= _SPAWN_WORKER_BUDGET:
+        return workers
+    projected = est * (2 * workers + 1)
+    print(f"  NOTE: dataset is ~{est / 1024**3:.1f}GB and this platform starts DataLoader "
+          f"workers by 'spawn', which copies it into every worker "
+          f"(~{projected / 1024**3:.1f}GB for {workers} workers x train+val).")
+    print(f"        Using num_workers=0 (main-process loading) instead - otherwise this "
+          f"MemoryErrors before the first batch. Set DBH_FORCE_WORKERS=1 to override.")
+    return 0
+
+
 def make_loaders(samples: List[Dict], cfg: Config):
     random.shuffle(samples)
     n_val = max(1, int(len(samples) * cfg.val_split))
     val, train = samples[:n_val], samples[n_val:]
+    wps = max(1, cfg.windows_per_sample)
+    avg_notes = float(np.mean([s['length'] for s in samples])) if samples else 0.0
+    coverage = min(1.0, wps * cfg.max_seq_len / avg_notes) if avg_notes else 1.0
     print(f"Train samples: {len(train)}  Val samples: {len(val)}")
+    print(f"Windows/sample: {wps} (max_seq_len={cfg.max_seq_len})  ->  "
+          f"{len(train) * wps} train windows per epoch, covering ~{coverage:.0%} of each "
+          f"sample's ~{avg_notes:,.0f} notes")
+    if coverage < 0.5:
+        print(f"  NOTE: over half of every cached sample goes unseen each epoch - "
+              f"raise --windows_per_sample to use more of the cache you already built.")
+    workers = _resolve_num_workers(samples, cfg)
     g = torch.Generator(); g.manual_seed(GLOBAL_SEED)
-    tl = DataLoader(SegDataset(train, cfg), batch_size=cfg.batch_size, shuffle=True,
-                    num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
-                    persistent_workers=(cfg.num_workers > 0),
-                    worker_init_fn=_worker_init_fn if cfg.num_workers > 0 else None,
+    tl = DataLoader(SegDataset(train, cfg, windows_per_sample=wps),
+                    batch_size=cfg.batch_size, shuffle=True,
+                    num_workers=workers, pin_memory=True, drop_last=True,
+                    persistent_workers=(workers > 0),
+                    worker_init_fn=_worker_init_fn if workers > 0 else None,
                     generator=g)
-    vl = DataLoader(SegDataset(val, cfg), batch_size=cfg.batch_size, shuffle=False,
-                    num_workers=cfg.num_workers, pin_memory=True,
-                    persistent_workers=(cfg.num_workers > 0),
-                    worker_init_fn=_worker_init_fn if cfg.num_workers > 0 else None)
+    # deterministic=True: val_F1 must be comparable across epochs - see SegDataset docstring
+    vl = DataLoader(SegDataset(val, cfg, windows_per_sample=wps, deterministic=True),
+                    batch_size=cfg.batch_size, shuffle=False,
+                    num_workers=workers, pin_memory=True,
+                    persistent_workers=(workers > 0),
+                    worker_init_fn=_worker_init_fn if workers > 0 else None)
     return tl, vl
 
 
@@ -815,6 +941,50 @@ def evaluate(model, loader, device, cfg):
     return {'loss': tot_loss / max(n, 1), 'precision': precision, 'recall': recall, 'f1': f1}
 
 
+@torch.no_grad()
+def sweep_threshold(model, loader, device, cfg, thresholds=None) -> List[Dict]:
+    """
+    Score the validation set at MANY decision thresholds, not just the 0.5 baked into
+    compute_loss/evaluate.
+
+    DESIGN: every P/R/F1 printed during training uses a hardcoded 0.5 cutoff, which is
+    almost never the F1-optimal operating point when positives are rare (~1 boundary
+    per 17 measure-start notes here). The trained model can be materially better than
+    its reported val_F1 suggests - it just needs a different threshold at inference.
+    This sweeps once over the val set, caching probabilities, so all thresholds are
+    scored on identical predictions. The winning threshold is what to pass to
+    --threshold at infer time.
+    """
+    model.eval()
+    probs_all, tgts_all = [], []
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        logits = model(batch)
+        valid = (~batch['pad_mask']) & (batch['is_measure_start'] == 1)
+        if valid.sum() == 0:
+            continue
+        probs_all.append(torch.sigmoid(logits[valid]).float().cpu())
+        tgts_all.append(batch['tgt_boundary'][valid].float().cpu())
+    if not probs_all:
+        return []
+    p = torch.cat(probs_all).numpy()
+    t = torch.cat(tgts_all).numpy()
+    if thresholds is None:
+        thresholds = np.arange(0.05, 0.96, 0.05)
+    rows = []
+    for th in thresholds:
+        pred = p >= th
+        tp = float((pred & (t == 1)).sum())
+        fp = float((pred & (t == 0)).sum())
+        fn = float((~pred & (t == 1)).sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        rows.append({'threshold': float(th), 'precision': precision,
+                     'recall': recall, 'f1': f1})
+    return rows
+
+
 # =============================================================================
 # TRAINING
 # =============================================================================
@@ -864,7 +1034,7 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
             if (step + 1) % 10 == 0 or step == num_batches - 1:
                 print(f"\r  Epoch {epoch+1}/{cfg.max_epochs}  batch {step+1}/{num_batches}  "
                       f"loss={loss.item():.4f}  P={parts['precision']:.2f} R={parts['recall']:.2f} "
-                      f"F1={parts['f1']:.2f}  lr={sched.get_last_lr()[0]:.2e}   ",
+                      f"F1={parts['f1']:.2f}  lr={sched.get_last_lr()[0]:.2e}",
                       end='', flush=True)
           except RuntimeError as exc:
             if 'out of memory' in str(exc).lower():
@@ -876,22 +1046,22 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
                 _report_error(f"training step failed at epoch {epoch+1} "
                               f"batch {step+1}/{num_batches}", exc, fatal=True)
             raise
-        print()
 
         val = evaluate(model, val_loader, device, cfg)
         nb = num_batches
-        print(f"Epoch {epoch:03d}  train_loss={run_loss/nb:.4f}  "
-              f"val_loss={val['loss']:.4f}  val_P={val['precision']:.3f}  "
-              f"val_R={val['recall']:.3f}  val_F1={val['f1']:.3f}  {time.time()-t0:.0f}s")
+        is_best = val['f1'] > best_f1
+        best_tag = "  (✓ new best)" if is_best else ""
+        print(f" | train_loss={run_loss/nb:.4f}  val_P={val['precision']:.3f} "
+              f"val_R={val['recall']:.3f}  val_F1={val['f1']:.3f}  {time.time()-t0:.0f}s{best_tag}")
 
         ck = {'epoch': epoch, 'model': model.state_dict(), 'optimizer': opt.state_dict(),
               'scheduler': sched.state_dict(), 'best_f1': best_f1, 'config': asdict(cfg)}
         try:
             torch.save(ck, os.path.join(ckpt_dir, 'last.pt'))
-            if val['f1'] > best_f1:
+            if is_best:
                 best_f1 = val['f1']; ck['best_f1'] = best_f1
                 torch.save(ck, os.path.join(ckpt_dir, 'best.pt'))
-                print(f"  ✓ new best (val_F1={best_f1:.4f})"); bad = 0
+                bad = 0
             else:
                 bad += 1
                 if bad >= cfg.early_stop_patience:
@@ -899,8 +1069,35 @@ def train(cfg: Config, samples: List[Dict], run_name: str, resume: Optional[str]
         except Exception as exc:
             _report_error(f"saving checkpoint for epoch {epoch+1} to '{ckpt_dir}'", exc, fatal=True)
 
-    print(f"\nDone. Best val F1: {best_f1:.4f}  ->  {ckpt_dir}/best.pt")
-    return {'best_f1': best_f1, 'ckpt_dir': ckpt_dir, 'best_ckpt': os.path.join(ckpt_dir, 'best.pt')}
+    best_path = os.path.join(ckpt_dir, 'best.pt')
+    print(f"\nDone. Best val F1: {best_f1:.4f}  ->  {best_path}")
+
+    # The val_F1 above is scored at a fixed 0.5 cutoff. Report what the SAME model
+    # achieves at other thresholds so the real operating point isn't left on the table.
+    best_threshold = 0.5
+    if os.path.exists(best_path):
+        try:
+            model.load_state_dict(torch.load(best_path, map_location=device)['model'])
+            rows = sweep_threshold(model, val_loader, device, cfg)
+            if rows:
+                print(f"\n── Validation threshold sweep (best checkpoint) ──────────")
+                print(f"  {'thresh':>7}  {'P':>7}  {'R':>7}  {'F1':>7}")
+                for r in rows:
+                    mark = ""
+                    print(f"  {r['threshold']:>7.2f}  {r['precision']:>7.3f}  "
+                          f"{r['recall']:>7.3f}  {r['f1']:>7.3f}{mark}")
+                top = max(rows, key=lambda r: r['f1'])
+                best_threshold = top['threshold']
+                print(f"  -> best F1={top['f1']:.4f} at threshold={top['threshold']:.2f}  "
+                      f"(P={top['precision']:.3f} R={top['recall']:.3f})")
+                print(f"     training reported F1={best_f1:.4f} at the fixed 0.50 cutoff.")
+                print(f"     Pass --threshold {top['threshold']:.2f} at infer time.")
+                print(f"──────────────────────────────────────────────────────────\n")
+        except Exception as exc:
+            _report_error(f"threshold sweep on '{best_path}'", exc)
+
+    return {'best_f1': best_f1, 'ckpt_dir': ckpt_dir, 'best_ckpt': best_path,
+            'best_threshold': best_threshold}
 
 
 # =============================================================================
@@ -1131,7 +1328,22 @@ def main():
     p.add_argument('--lr', type=float, default=None)
     p.add_argument('--d_model', type=int, default=None)
     p.add_argument('--num_layers', type=int, default=None)
-    p.add_argument('--max_seq_len', type=int, default=None)
+    p.add_argument('--max_seq_len', type=int, default=None,
+                   help='TRAIN: notes of context per window (default 512). To call a bar a '
+                        'boundary the model must compare it against the PREVIOUS theme block, '
+                        'so a window shorter than ~2 blocks starves the comparison. Attention '
+                        'cost is O(n^2) in this value - raise it and lower --batch_size together '
+                        'if VRAM is tight.')
+    p.add_argument('--windows_per_sample', type=int, default=None,
+                   help='TRAIN: how many windows each cached sample yields per epoch '
+                        '(default 8). A cached sample averages ~9k notes, so at '
+                        'max_seq_len=512 one window sees only ~6%% of it - this is the '
+                        'cheapest way to train on more of the cache you ALREADY built, '
+                        'with no rebuild. Epoch time scales roughly linearly with it.')
+    p.add_argument('--early_stop_patience', type=int, default=None,
+                   help='TRAIN: epochs without a new best val_F1 before stopping (default 15). '
+                        'OneCycleLR anneals across ALL --epochs, and most of the final gain is '
+                        'in that low-LR tail, so too-tight patience kills runs mid-schedule.')
     p.add_argument('--pos_weight', type=float, default=None,
                    help='TRAIN: class-imbalance weight for the rare positive (boundary) '
                         'class in the loss (default 8.0). Raise if precision is very high '
@@ -1172,6 +1384,8 @@ def main():
         if args.d_model is not None: c.d_model = args.d_model
         if args.num_layers is not None: c.num_layers = args.num_layers
         if args.max_seq_len is not None: c.max_seq_len = args.max_seq_len
+        if args.windows_per_sample is not None: c.windows_per_sample = args.windows_per_sample
+        if args.early_stop_patience is not None: c.early_stop_patience = args.early_stop_patience
         if args.pos_weight is not None: c.pos_weight = args.pos_weight
         if args.num_workers is not None: c.num_workers = args.num_workers
         return c
