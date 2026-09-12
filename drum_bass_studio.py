@@ -441,6 +441,10 @@ class SegmentSettings:
 # =============================================================================
 
 class CollapsibleSection(ttk.Frame):
+    """Self-packing: manages its own fill/expand so that whichever section(s)
+    are currently open claim any extra vertical space the window is resized
+    into (rather than it collecting as dead space below the accordion), while
+    collapsed sections stay compact. See _toggle()."""
     def __init__(self, parent, title: str, start_open: bool = False):
         super().__init__(parent)
         self._open = tk.BooleanVar(value=start_open)
@@ -451,7 +455,8 @@ class CollapsibleSection(ttk.Frame):
         self._toggle_btn.pack(fill='x')
         self.body = ttk.Frame(self, relief='groove', borderwidth=1)
         if start_open:
-            self.body.pack(fill='x', pady=(2, 6))
+            self.body.pack(fill='both', expand=True, pady=(2, 6))
+        self.pack(fill='both' if start_open else 'x', expand=start_open)
 
     def _arrow(self):
         return "\u25bc" if self._open.get() else "\u25b6"
@@ -461,9 +466,10 @@ class CollapsibleSection(ttk.Frame):
         title = self._toggle_btn.cget('text').split(' ', 1)[1]
         self._toggle_btn.config(text=self._arrow() + " " + title)
         if self._open.get():
-            self.body.pack(fill='x', pady=(2, 6))
+            self.body.pack(fill='both', expand=True, pady=(2, 6))
         else:
             self.body.pack_forget()
+        self.pack_configure(fill='both' if self._open.get() else 'x', expand=self._open.get())
 
     def set_title(self, title: str):
         self._toggle_btn.config(text=self._arrow() + " " + title)
@@ -496,6 +502,7 @@ class StudioApp:
         root.title("Drum + Bass Humanization Studio")
         root.geometry("900x820")
         root.minsize(720, 560)
+        root.resizable(True, True)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.drum_path: Optional[str] = None
@@ -511,6 +518,7 @@ class StudioApp:
         self.seg_cfg = None
         self.seg_checkpoint_path: Optional[str] = None
         self.hum_checkpoint_path: Optional[str] = None
+        self.seg_threshold_var = tk.DoubleVar(value=SEGMENTATION_CONFIDENCE_THRESHOLD)
 
         self.temp_dir = tempfile.mkdtemp(prefix='drum_bass_studio_')
         self.player = gfx.MidiPlayer() if HAS_GFX else None
@@ -558,10 +566,29 @@ class StudioApp:
         self.seg_model_label.pack(side='left', padx=6)
         ttk.Button(top2, text="Load...", command=self._on_load_seg_model).pack(side='right')
 
+        # -- segmentation sensitivity --
+        # Maps directly to the model's boundary-probability threshold (see
+        # SEGMENTATION_CONFIDENCE_THRESHOLD in config.py): 0.05-0.95 is the same
+        # range drum_theme_segmentation.py's own sweep_threshold() scores at
+        # training time, so every value here is one the model was actually
+        # evaluated at. The scale is reversed (from_=0.95 to=0.05) so dragging
+        # right raises sensitivity (lower threshold -> more, subtler boundaries)
+        # and dragging left lowers it (higher threshold -> fewer, more confident
+        # ones) - "more sensitive" reads naturally as "further right".
+        top3 = ttk.Frame(self.root); top3.pack(fill='x', padx=8, pady=(0, 6))
+        ttk.Label(top3, text="Segmentation sensitivity:").pack(side='left')
+        self.seg_threshold_scale = ttk.Scale(top3, from_=0.95, to=0.05, orient='horizontal',
+                                             variable=self.seg_threshold_var,
+                                             command=self._on_seg_threshold_drag)
+        self.seg_threshold_scale.pack(side='left', fill='x', expand=True, padx=(8, 4))
+        self.seg_threshold_label = ttk.Label(top3, text=f"{SEGMENTATION_CONFIDENCE_THRESHOLD:.2f}", width=5)
+        self.seg_threshold_label.pack(side='left')
+        self.seg_threshold_scale.bind('<ButtonRelease-1>', self._on_seg_threshold_release)
+
         # -- drum drop zone --
         ttk.Label(self.root, text="Drum MIDI (full song):").pack(anchor='w', padx=8)
         self.drum_drop = tk.Label(self.root, text=self._drop_text("drum"), relief='groove',
-                                  bd=2, height=2, bg='#f5f5f5', fg='#555', cursor='hand2')
+                                  bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.drum_drop.pack(fill='x', padx=8, pady=(0, 4))
         self.drum_drop.bind('<Button-1>', self._on_browse_drum)
 
@@ -574,7 +601,7 @@ class StudioApp:
         # -- bass drop zone --
         ttk.Label(self.root, text="Bass MIDI (matching song, same tempo/alignment):").pack(anchor='w', padx=8, pady=(6, 0))
         self.bass_drop = tk.Label(self.root, text=self._drop_text("bass"), relief='groove',
-                                  bd=2, height=2, bg='#f5f5f5', fg='#555', cursor='hand2')
+                                  bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.bass_drop.pack(fill='x', padx=8, pady=(0, 6))
         self.bass_drop.bind('<Button-1>', self._on_browse_bass)
 
@@ -591,11 +618,8 @@ class StudioApp:
         # -- body holding the three phase sections --
         outer = ttk.Frame(self.root); outer.pack(fill='both', expand=True, padx=8)
         self.phase1_section = CollapsibleSection(outer, "Phase 1 -- Drum Humanize", start_open=PHASE1_SECTION_STARTS_OPEN)
-        self.phase1_section.pack(fill='x')
         self.phase2_section = CollapsibleSection(outer, "Phase 2 -- Rush / Drag", start_open=PHASE2_SECTION_STARTS_OPEN)
-        self.phase2_section.pack(fill='x')
         self.phase3_section = CollapsibleSection(outer, "Phase 3 -- Bass Sync", start_open=PHASE3_SECTION_STARTS_OPEN)
-        self.phase3_section.pack(fill='x')
         self._build_phase1_controls(self.phase1_section.body)
         self._build_phase2_controls(self.phase2_section.body)
         self._build_phase3_controls(self.phase3_section.body)
@@ -652,6 +676,27 @@ class StudioApp:
         self.seg_model_label.config(text=os.path.basename(path), foreground='black')
         self._set_status(f"Segmentation model loaded: {os.path.basename(path)}")
 
+    def _on_seg_threshold_drag(self, value_str):
+        """Live-update the numeric readout while dragging. Re-segmenting is
+        deferred to <ButtonRelease-1> (_on_seg_threshold_release) since it
+        reruns the model and shouldn't fire on every pixel of drag."""
+        self.seg_threshold_label.config(text=f"{float(value_str):.2f}")
+
+    def _on_seg_threshold_release(self, event=None):
+        # Snap to the 0.05 steps sweep_threshold() actually scores, so the
+        # value shown is always one the model was validated at.
+        snapped = round(self.seg_threshold_var.get() / 0.05) * 0.05
+        snapped = min(0.95, max(0.05, snapped))
+        self.seg_threshold_var.set(snapped)
+        self.seg_threshold_label.config(text=f"{snapped:.2f}")
+        if self.seg_model is not None and self.drum_path:
+            self.selected_index = None
+            self.segments = []
+            self.segment_click_targets = {}
+            self.seg_canvas.delete('all')
+            self._set_status(f"Re-segmenting at sensitivity threshold {snapped:.2f}...", busy=True)
+            threading.Thread(target=self._segment_worker, args=(self.drum_path, snapped), daemon=True).start()
+
     # ---------------------------------------------------------- drop zones --
     def _on_browse_drum(self, event=None):
         path = filedialog.askopenfilename(title="Select drum MIDI",
@@ -694,12 +739,13 @@ class StudioApp:
         self.segment_click_targets = {}
         self.seg_canvas.delete('all')
         self._set_status(f"Segmenting '{os.path.basename(path)}'...", busy=True)
-        threading.Thread(target=self._segment_worker, args=(path,), daemon=True).start()
+        threading.Thread(target=self._segment_worker, args=(path, self.seg_threshold_var.get()),
+                         daemon=True).start()
 
-    def _segment_worker(self, path):
+    def _segment_worker(self, path, threshold):
         try:
             result = dts.compute_segment_boundaries(self.seg_model, self.seg_cfg, path,
-                                                     threshold=SEGMENTATION_CONFIDENCE_THRESHOLD,
+                                                     threshold=threshold,
                                                      context_overlap=SEGMENTATION_CONTEXT_OVERLAP)
             starts = result['starts']
             total_measures = result['total_measures']
