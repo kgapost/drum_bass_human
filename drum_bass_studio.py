@@ -175,6 +175,36 @@ def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
     return path, tempo, len(inst.notes)
 
 
+def force_all_drums_to_temp(source_path: str, temp_dir: str) -> str:
+    """
+    The 'Drum MIDI' drop zone is an explicit statement of intent - whatever file
+    lands there IS the drum part, regardless of which MIDI channel/program the
+    exporting DAW put it on. Reaper (and others) routinely export a single drum
+    track on channel 1 rather than the MIDI-standard channel 10, so pretty_midi's
+    is_drum flag misses it entirely - any GM playback device then falls back to
+    channel 1's default program (Acoustic Grand Piano), and every is_drum-gated
+    step downstream (segmentation, humanizing, slicing) sees zero drum notes.
+
+    drum_humanizer_v3.py/drum_theme_segmentation.py guess at this with a careful
+    single-track/name-match fallback because THEY scan a whole unlabeled library
+    where guessing wrong risks folding a bass or melodic line into "drums". That
+    ambiguity doesn't exist here - the user already resolved it by dropping the
+    file into this specific control - so this forces EVERY note in the file onto
+    one is_drum=True instrument, unconditionally. Only .instruments is replaced;
+    tempo/time-signature data is untouched, so segment timing on multi-tempo
+    songs is unaffected.
+    """
+    midi = pretty_midi.PrettyMIDI(source_path)
+    forced = pretty_midi.Instrument(program=0, is_drum=True, name="Drums (forced)")
+    for inst in midi.instruments:
+        forced.notes.extend(inst.notes)
+    forced.notes.sort(key=lambda n: n.start)
+    midi.instruments = [forced]
+    out_path = os.path.join(temp_dir, f"forced_drums_{uuid.uuid4().hex[:8]}.mid")
+    midi.write(out_path)
+    return out_path
+
+
 def _report_error(context: str, exc: BaseException) -> str:
     if HAS_GFX:
         return gfx._report_error(context, exc)
@@ -771,14 +801,20 @@ class StudioApp:
             messagebox.showwarning("No segmentation model",
                                    "Load a segmentation model first (top of window).")
             return
-        self.drum_path = path
+        try:
+            forced_path = force_all_drums_to_temp(path, self.temp_dir)
+        except Exception as exc:
+            msg = _report_error(f"forcing drum channel on '{path}'", exc)
+            messagebox.showerror("Failed to load drum MIDI", msg)
+            return
+        self.drum_path = forced_path
         self.drum_drop.config(text=os.path.basename(path), foreground='black')
         self.selected_index = None
         self.segments = []
         self.segment_click_targets = {}
         self.seg_canvas.delete('all')
         self._set_status(f"Segmenting '{os.path.basename(path)}'...", busy=True)
-        threading.Thread(target=self._segment_worker, args=(path, self.seg_threshold_var.get()),
+        threading.Thread(target=self._segment_worker, args=(forced_path, self.seg_threshold_var.get()),
                          daemon=True).start()
 
     def _segment_worker(self, path, threshold):
