@@ -1,14 +1,14 @@
 """
-Fetch the bundled pretrained humanizer model from the shared Google Drive folder,
-if it isn't already present locally.
+Fetch the bundled pretrained models (humanizer + segmentation) from the shared
+Google Drive folder, if they aren't already present locally.
 
-DESIGN: pretrained/ is gitignored (see knowledge.md/README - a ~250MB checkpoint
-doesn't belong in git history), so a fresh clone of this repo has NO model at all
+DESIGN: pretrained/ is gitignored (see knowledge.md/README - these checkpoints
+don't belong in git history), so a fresh clone of this repo has NO models at all
 until this runs once. drum_bass_studio.py calls this automatically at startup;
 it's also runnable standalone:
 
-    python download_pretrained.py            # fetch only if missing locally
-    python download_pretrained.py --force     # re-fetch even if already present
+    python download_pretrained.py            # fetch only whichever are missing locally
+    python download_pretrained.py --force     # re-fetch both even if already present
 
 Needs the 'gdown' package (pip install gdown) - it's what makes this reliable for
 a large file, handling Google's virus-scan-warning interstitial and confirmation
@@ -26,62 +26,72 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import drum_humanizer_v3 as dh
+import drum_theme_segmentation as dts
 
 # DESIGN: this is the shared Drive FOLDER's id, not a specific file id. Matching by
 # filename inside the folder - rather than hardcoding a file id - means re-uploading
 # a replacement model in Drive is picked up automatically with no code change here.
+# Both models live side by side in this one folder.
 PRETRAINED_DRIVE_FOLDER_ID = '1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye'
 PRETRAINED_DRIVE_FOLDER_URL = f'https://drive.google.com/drive/folders/{PRETRAINED_DRIVE_FOLDER_ID}'
 
-_EXPECTED_FILES = {
-    'humanizer_best.pt': dh.DEFAULT_PRETRAINED_CHECKPOINT,
-    'humanizer_metadata.json': dh.DEFAULT_PRETRAINED_METADATA,
-}
+_MODELS = [
+    {'label': 'humanizer', 'ckpt_name': 'humanizer_best.pt', 'meta_name': 'humanizer_metadata.json',
+     'ckpt_path': dh.DEFAULT_PRETRAINED_CHECKPOINT, 'meta_path': dh.DEFAULT_PRETRAINED_METADATA,
+     'pretrained_dir': dh.PRETRAINED_DIR},
+    {'label': 'segmentation', 'ckpt_name': 'segmentation_best.pt', 'meta_name': 'segmentation_metadata.json',
+     'ckpt_path': dts.DEFAULT_PRETRAINED_CHECKPOINT, 'meta_path': dts.DEFAULT_PRETRAINED_METADATA,
+     'pretrained_dir': dts.PRETRAINED_DIR},
+]
 
 
 def ensure_pretrained_model(force: bool = False, quiet: bool = False) -> bool:
     """
-    Make sure pretrained/humanizer_best.pt exists locally, downloading it from the
-    shared Drive folder if not.
+    Make sure both bundled pretrained checkpoints (humanizer + segmentation) exist
+    locally, downloading whichever are missing from the shared Drive folder.
 
-    Returns True if the checkpoint is available locally after this call, False if
-    it couldn't be obtained (no gdown, offline, nothing uploaded yet, Drive error).
+    Returns True if every model is available locally after this call, False if any
+    couldn't be obtained (no gdown, offline, nothing uploaded yet, Drive error).
     NEVER raises - this is a best-effort startup convenience, not a hard dependency.
-    --mode infer and the UI both still work with an explicit --checkpoint even if
-    this fails outright.
+    --mode infer/train and the UI all still work with an explicit --checkpoint even
+    if this fails outright.
     """
-    if not force and os.path.exists(dh.DEFAULT_PRETRAINED_CHECKPOINT):
+    missing = [m for m in _MODELS if force or not os.path.exists(m['ckpt_path'])]
+    if not missing:
         return True
     if not HAS_GDOWN:
         print("[pretrained] 'gdown' not installed (pip install gdown) - skipping "
               "auto-download. Pass --checkpoint explicitly, or install gdown and rerun.")
         return False
-    tmp_paths = [p + '.tmp' for p in _EXPECTED_FILES.values()]
+    tmp_paths = [p + '.tmp' for m in _MODELS for p in (m['ckpt_path'], m['meta_path'])]
+    all_ok = True
     try:
-        print(f"[pretrained] No local model found - checking the shared Drive folder "
-              f"({PRETRAINED_DRIVE_FOLDER_URL}) ...")
+        print(f"[pretrained] Checking the shared Drive folder "
+              f"({PRETRAINED_DRIVE_FOLDER_URL}) for missing models "
+              f"({', '.join(m['label'] for m in missing)}) ...")
         remote_files = gdown.download_folder(id=PRETRAINED_DRIVE_FOLDER_ID,
                                              skip_download=True, quiet=True)
         by_name = {os.path.basename(f.path): f for f in remote_files}
-        if 'humanizer_best.pt' not in by_name:
-            print(f"[pretrained] No 'humanizer_best.pt' in the shared Drive folder yet "
-                  f"- nothing to download. Upload one there, or pass --checkpoint "
-                  f"explicitly / run --mode grid_search to train one.")
-            return False
-        os.makedirs(dh.PRETRAINED_DIR, exist_ok=True)
-        for name, local_path in _EXPECTED_FILES.items():
-            if name not in by_name:
-                continue   # metadata.json is nice-to-have, not required
-            tmp = local_path + '.tmp'
-            gdown.download(id=by_name[name].id, output=tmp, quiet=quiet)
-            os.replace(tmp, local_path)   # atomic - never leaves a half-downloaded model
-        size_mb = os.path.getsize(dh.DEFAULT_PRETRAINED_CHECKPOINT) / 1e6
-        print(f"[pretrained] Downloaded humanizer_best.pt ({size_mb:.0f}MB) -> "
-              f"{dh.DEFAULT_PRETRAINED_CHECKPOINT}")
-        return True
+        for m in missing:
+            if m['ckpt_name'] not in by_name:
+                print(f"[pretrained] No '{m['ckpt_name']}' in the shared Drive folder yet "
+                      f"- nothing to download for {m['label']}. Upload one there, or pass "
+                      f"--checkpoint explicitly / train one.")
+                all_ok = False
+                continue
+            os.makedirs(m['pretrained_dir'], exist_ok=True)
+            for name, local_path in ((m['ckpt_name'], m['ckpt_path']), (m['meta_name'], m['meta_path'])):
+                if name not in by_name:
+                    continue   # metadata.json is nice-to-have, not required
+                tmp = local_path + '.tmp'
+                gdown.download(id=by_name[name].id, output=tmp, quiet=quiet)
+                os.replace(tmp, local_path)   # atomic - never leaves a half-downloaded model
+            size_mb = os.path.getsize(m['ckpt_path']) / 1e6
+            print(f"[pretrained] Downloaded {m['ckpt_name']} ({size_mb:.0f}MB) -> {m['ckpt_path']}")
+        return all_ok
     except Exception as exc:
-        print(f"[pretrained] Could not fetch the model from Google Drive "
-              f"({type(exc).__name__}: {exc}). Continuing without it - pass "
+        print(f"[pretrained] Could not fetch models from Google Drive "
+              f"({type(exc).__name__}: {exc}). Continuing without them - pass "
               f"--checkpoint explicitly, or retry later.")
         return False
     finally:

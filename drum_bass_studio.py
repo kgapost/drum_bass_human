@@ -525,43 +525,73 @@ class StudioApp:
         self.playing_path: Optional[str] = None
 
         self._build_widgets()
+        # DESIGN: pretrained/ is gitignored (see README), so a fresh clone/machine has
+        # no models at all yet - try fetching both from the shared Drive folder first,
+        # in one call. This runs before mainloop() starts, so it's a one-time blocking
+        # delay only when a model is genuinely missing; every later launch finds them
+        # locally and skips the network check entirely.
+        if HAS_PRETRAINED_DOWNLOADER:
+            ensure_pretrained_model()
         self._load_default_pretrained()
+        self._load_default_seg_model()
         self._refresh_gating()
+
+    def _set_model_status(self, dot, state):
+        """Very small colored dot beside each model label confirming it actually
+        loaded. 'ok' (green) / 'error' (red, load was attempted and failed) /
+        'none' (gray, nothing loaded yet)."""
+        color = {'ok': '#0ca30c', 'error': '#d03b3b', 'none': '#c3c2b7'}[state]
+        dot.config(foreground=color)
 
     def _load_default_pretrained(self):
         """Auto-select the bundled pretrained/humanizer_best.pt, if present, so the
         app is usable without a manual 'Load...' click. Still fully overridable -
         this only sets the same state a manual Load does.
 
-        DESIGN: pretrained/ is gitignored (see README), so a fresh clone/machine has
-        no model at all yet - try fetching it from the shared Drive folder first.
-        This runs before mainloop() starts, so it's a one-time blocking delay only
-        when the model is genuinely missing; every later launch finds it locally and
-        skips the network check entirely. Best-effort either way: a failed/skipped
-        download just leaves the label at "(none loaded)", same as on a checkout
-        with no pretrained/ folder at all - the user can still Load... manually.
+        Best-effort: a failed/skipped download just leaves the label at "(none
+        loaded)" (and the status dot gray), same as on a checkout with no pretrained/
+        folder at all - the user can still Load... manually.
         """
         if not HAS_HUMANIZER:
             return
-        if HAS_PRETRAINED_DOWNLOADER:
-            ensure_pretrained_model()
         path = dhu.DEFAULT_PRETRAINED_CHECKPOINT
         if os.path.exists(path):
             self.hum_checkpoint_path = path
             self.hum_model_label.config(text=f"{os.path.basename(path)} (bundled default)",
                                         foreground='black')
+            self._set_model_status(self.hum_status_dot, 'ok')
+
+    def _load_default_seg_model(self):
+        """Auto-load the bundled pretrained/segmentation_best.pt, if present, so
+        segment detection works without a manual 'Load...' click. Unlike the
+        humanizer (a lazy checkpoint path, only read when Phase 1 actually runs),
+        the segmentation model is an eagerly-loaded in-memory nn.Module - so this
+        reuses the same threaded worker as the manual Load button, just pointed at
+        the bundled default and with the failure messagebox suppressed (this runs
+        automatically at startup, not from a user click)."""
+        if not HAS_SEGMENTATION:
+            return
+        path = dts.DEFAULT_PRETRAINED_CHECKPOINT
+        if not os.path.exists(path):
+            return
+        threading.Thread(target=self._load_seg_model_worker, args=(path,),
+                         kwargs={'show_error': False, 'is_default': True}, daemon=True).start()
 
     # ------------------------------------------------------------------ UI --
     def _build_widgets(self):
         # -- model loaders --
         top = ttk.Frame(self.root); top.pack(fill='x', padx=8, pady=(8, 2))
         ttk.Label(top, text="Humanizer model:").pack(side='left')
+        self.hum_status_dot = tk.Label(top, text="●", foreground='#c3c2b7', font=('Segoe UI', 8))
+        self.hum_status_dot.pack(side='left', padx=(6, 0))
         self.hum_model_label = ttk.Label(top, text="(none loaded)", foreground='gray')
         self.hum_model_label.pack(side='left', padx=6)
         ttk.Button(top, text="Load...", command=self._on_load_hum_model).pack(side='right')
 
         top2 = ttk.Frame(self.root); top2.pack(fill='x', padx=8, pady=(0, 6))
         ttk.Label(top2, text="Segmentation model:").pack(side='left')
+        self.seg_status_dot = tk.Label(top2, text="●", foreground='#c3c2b7', font=('Segoe UI', 8))
+        self.seg_status_dot.pack(side='left', padx=(6, 0))
         self.seg_model_label = ttk.Label(top2, text="(none loaded)", foreground='gray')
         self.seg_model_label.pack(side='left', padx=6)
         ttk.Button(top2, text="Load...", command=self._on_load_seg_model).pack(side='right')
@@ -646,6 +676,7 @@ class StudioApp:
             return
         self.hum_checkpoint_path = path
         self.hum_model_label.config(text=os.path.basename(path), foreground='black')
+        self._set_model_status(self.hum_status_dot, 'ok')
         self._set_status(f"Humanizer model set: {os.path.basename(path)}")
 
     def _on_load_seg_model(self):
@@ -659,22 +690,30 @@ class StudioApp:
         self._set_status("Loading segmentation model...", busy=True)
         threading.Thread(target=self._load_seg_model_worker, args=(path,), daemon=True).start()
 
-    def _load_seg_model_worker(self, path):
+    def _load_seg_model_worker(self, path, show_error=True, is_default=False):
         try:
             device = dts.torch.device('cuda' if dts.torch.cuda.is_available() else 'cpu')
             model, cfg = dts.load_model(path, device)
         except Exception as exc:
             msg = _report_error(f"loading segmentation model '{path}'", exc)
-            self.root.after(0, lambda: messagebox.showerror("Failed to load model", msg))
+            self.root.after(0, lambda: self._on_seg_model_load_failed(msg, show_error))
             return
-        self.root.after(0, lambda: self._on_seg_model_loaded(path, model, cfg))
+        self.root.after(0, lambda: self._on_seg_model_loaded(path, model, cfg, is_default))
 
-    def _on_seg_model_loaded(self, path, model, cfg):
+    def _on_seg_model_loaded(self, path, model, cfg, is_default=False):
         self.seg_model = model
         self.seg_cfg = cfg
         self.seg_checkpoint_path = path
-        self.seg_model_label.config(text=os.path.basename(path), foreground='black')
+        suffix = " (bundled default)" if is_default else ""
+        self.seg_model_label.config(text=f"{os.path.basename(path)}{suffix}", foreground='black')
+        self._set_model_status(self.seg_status_dot, 'ok')
         self._set_status(f"Segmentation model loaded: {os.path.basename(path)}")
+
+    def _on_seg_model_load_failed(self, msg, show_error):
+        self._set_model_status(self.seg_status_dot, 'error')
+        self._set_status("Segmentation model failed to load.")
+        if show_error:
+            messagebox.showerror("Failed to load model", msg)
 
     def _on_seg_threshold_drag(self, value_str):
         """Live-update the numeric readout while dragging. Re-segmenting is

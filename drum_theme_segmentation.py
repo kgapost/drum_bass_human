@@ -158,6 +158,17 @@ def _report_error(context: str, exc: BaseException, fatal: bool = False):
 
 
 # =============================================================================
+# BUNDLED PRETRAINED MODEL  (same pattern as drum_humanizer_v3.py)
+# =============================================================================
+# DESIGN: resolved against THIS FILE's directory, not the current working
+# directory - drum_bass_studio.py can be launched from anywhere, and the
+# bundled pretrained model should be found either way.
+PRETRAINED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pretrained')
+DEFAULT_PRETRAINED_CHECKPOINT = os.path.join(PRETRAINED_DIR, 'segmentation_best.pt')
+DEFAULT_PRETRAINED_METADATA = os.path.join(PRETRAINED_DIR, 'segmentation_metadata.json')
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
@@ -207,7 +218,7 @@ class Config:
     batch_size:       int = 16
     lr:               float = 3e-4
     weight_decay:     float = 0.01
-    max_epochs:       int = 40
+    max_epochs:       int = 50
     warmup_pct:       float = 0.1
     grad_clip:        float = 1.0
     val_split:        float = 0.1
