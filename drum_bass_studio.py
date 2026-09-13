@@ -144,22 +144,13 @@ seed_everything(GLOBAL_SEED)
 # SHARED MIDI HELPERS
 # =============================================================================
 
-def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
-                       temp_dir: str, drums_only: bool = False) -> str:
-    """
-    Write a NEW small MIDI file containing only the notes inside
-    [start_sec, end_sec) of source_path, times shifted to start at 0.
-    DESIGN: same approach as groove_finder_ui.py's _slice_segment_to_temp,
-    generalized to work for either the drum file (drums_only=True, since a
-    stray non-drum track should never leak in) or the bass file (drums_only=
-    False - a bass track is not marked is_drum in a MIDI file).
-    """
-    if not HAS_PRETTY_MIDI:
-        raise RuntimeError("pretty_midi is required to slice segments.")
+def _sliced_instrument(source_path: str, start_sec: float, end_sec: float,
+                       drums_only: bool, program: int) -> pretty_midi.Instrument:
+    """Notes from source_path inside [start_sec, end_sec), time-shifted to start
+    at 0, as a single Instrument. Shared by slice_midi_to_temp (one part, its own
+    file) and audition_both_to_temp (both parts, one file - see there for why)."""
     src = pretty_midi.PrettyMIDI(source_path)
-    tempo = gfx._tempo_at_time(src, start_sec) if HAS_GFX else 120.0
-    out = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    inst = pretty_midi.Instrument(program=0, is_drum=drums_only)
+    inst = pretty_midi.Instrument(program=program, is_drum=drums_only)
     for orig in src.instruments:
         if drums_only and not orig.is_drum:
             continue
@@ -169,10 +160,59 @@ def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
                     velocity=n.velocity, pitch=n.pitch,
                     start=n.start - start_sec,
                     end=max(n.start - start_sec + 0.01, n.end - start_sec)))
+    return inst
+
+
+def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
+                       temp_dir: str, drums_only: bool = False, program: int = 0) -> str:
+    """
+    Write a NEW small MIDI file containing only the notes inside
+    [start_sec, end_sec) of source_path, times shifted to start at 0.
+    DESIGN: same approach as groove_finder_ui.py's _slice_segment_to_temp,
+    generalized to work for either the drum file (drums_only=True, since a
+    stray non-drum track should never leak in) or the bass file (drums_only=
+    False - a bass track is not marked is_drum in a MIDI file).
+
+    program: GM program for the output instrument (ignored when drums_only,
+    since is_drum=True already selects the percussion kit regardless of
+    program). Defaults to 0 (Acoustic Grand Piano) for existing callers that
+    only feed this into pitch/timing processing and never play it directly;
+    pass an explicit program (e.g. 33, "Electric Bass (finger)" - same as
+    the render step's own bass_inst) when the slice will be auditioned.
+    """
+    if not HAS_PRETTY_MIDI:
+        raise RuntimeError("pretty_midi is required to slice segments.")
+    src = pretty_midi.PrettyMIDI(source_path)
+    tempo = gfx._tempo_at_time(src, start_sec) if HAS_GFX else 120.0
+    out = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    inst = _sliced_instrument(source_path, start_sec, end_sec, drums_only, program)
     out.instruments.append(inst)
     path = os.path.join(temp_dir, f"slice_{uuid.uuid4().hex[:8]}.mid")
     out.write(path)
     return path, tempo, len(inst.notes)
+
+
+def audition_both_to_temp(drum_path: str, bass_path: Optional[str], start_sec: float,
+                          end_sec: float, temp_dir: str) -> str:
+    """
+    Same idea as slice_midi_to_temp, but writes the drum AND bass slices into ONE
+    file as two instrument tracks sharing a single MIDI clock, instead of two
+    separate files. DESIGN: groove_finder_ui.MidiPlayer plays one file at a time,
+    so this is what makes "play both simultaneously" both possible AND perfectly
+    synced - two independently-started playbacks would drift/race, one merged
+    file has no sync problem to begin with. bass_path is optional (drum-only
+    segment if no bass file is loaded yet).
+    """
+    if not HAS_PRETTY_MIDI:
+        raise RuntimeError("pretty_midi is required to slice segments.")
+    tempo = gfx._tempo_at_time(pretty_midi.PrettyMIDI(drum_path), start_sec) if HAS_GFX else 120.0
+    out = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    out.instruments.append(_sliced_instrument(drum_path, start_sec, end_sec, True, 0))
+    if bass_path:
+        out.instruments.append(_sliced_instrument(bass_path, start_sec, end_sec, False, 33))
+    path = os.path.join(temp_dir, f"slice_both_{uuid.uuid4().hex[:8]}.mid")
+    out.write(path)
+    return path
 
 
 def force_all_drums_to_temp(source_path: str, temp_dir: str) -> str:
@@ -644,29 +684,50 @@ class StudioApp:
         self.seg_threshold_label = ttk.Label(top3, text=f"{SEGMENTATION_CONFIDENCE_THRESHOLD:.2f}", width=5)
         self.seg_threshold_label.pack(side='left')
         self.seg_threshold_scale.bind('<ButtonRelease-1>', self._on_seg_threshold_release)
+        # Arrow-key adjustment (after Tab-focusing the slider) doesn't fire a mouse
+        # ButtonRelease, so re-segmenting would otherwise never trigger for keyboard
+        # users - <KeyRelease> covers that the same way.
+        self.seg_threshold_scale.bind('<KeyRelease>', self._on_seg_threshold_release)
 
         # -- drum drop zone --
-        ttk.Label(self.root, text="Drum MIDI (full song):").pack(anchor='w', padx=8)
+        drum_label_row = ttk.Frame(self.root); drum_label_row.pack(fill='x', padx=8)
+        ttk.Label(drum_label_row, text="Drum MIDI (full song):").pack(side='left')
+        ttk.Button(drum_label_row, text="▶ Audition selected segment",
+                  command=self._on_audition_raw_both).pack(side='right')
+        ttk.Button(drum_label_row, text="▶ Audition selected drum segment",
+                  command=self._on_audition_raw_drum).pack(side='right', padx=(0, 6))
         self.drum_drop = tk.Label(self.root, text=self._drop_text("drum"), relief='groove',
                                   bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.drum_drop.pack(fill='x', padx=8, pady=(0, 4))
         self.drum_drop.bind('<Button-1>', self._on_browse_drum)
 
-        # -- segment timeline --
-        self.seg_canvas = tk.Canvas(self.root, height=0, bg='#e8e8e8', highlightthickness=0)
-        self.seg_canvas.pack(fill='x', padx=8, pady=(0, 4))
-        self.seg_label = ttk.Label(self.root, text="", foreground='gray')
-        self.seg_label.pack(anchor='w', padx=8)
+        # Segmentation results OVERLAP the drop zone itself (same footprint) once
+        # computed, instead of taking their own row below it - saves the vertical
+        # space a separate timeline strip used to cost. place(in_=...,
+        # relwidth=1, relheight=1) tracks the drop zone's size/position exactly,
+        # including through a window resize; place_forget() reveals the drop
+        # zone's own text again whenever there's nothing to show. See _draw_timeline.
+        self.seg_canvas = tk.Canvas(self.root, bg='#e8e8e8', highlightthickness=0)
+        self.seg_canvas.bind('<Configure>', lambda e: self._redraw_timeline_canvas(self.seg_canvas, self.drum_drop))
 
         # -- bass drop zone --
-        ttk.Label(self.root, text="Bass MIDI (matching song, same tempo/alignment):").pack(anchor='w', padx=8, pady=(6, 0))
+        bass_label_row = ttk.Frame(self.root); bass_label_row.pack(fill='x', padx=8, pady=(6, 0))
+        ttk.Label(bass_label_row, text="Bass MIDI (matching song, same tempo/alignment):").pack(side='left')
+        ttk.Button(bass_label_row, text="▶ Audition selected bass segment",
+                  command=self._on_audition_raw_bass).pack(side='right')
         self.bass_drop = tk.Label(self.root, text=self._drop_text("bass"), relief='groove',
                                   bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.bass_drop.pack(fill='x', padx=8, pady=(0, 6))
         self.bass_drop.bind('<Button-1>', self._on_browse_bass)
 
+        # Same overlap treatment on the bass drop zone - the segment timeline is
+        # one song structure, shown wherever there's a drop zone for it.
+        self.seg_canvas_bass = tk.Canvas(self.root, bg='#e8e8e8', highlightthickness=0)
+        self.seg_canvas_bass.bind('<Configure>', lambda e: self._redraw_timeline_canvas(self.seg_canvas_bass, self.bass_drop))
+
         if HAS_DND:
-            for widget, kind in ((self.drum_drop, 'drum'), (self.bass_drop, 'bass')):
+            for widget, kind in ((self.drum_drop, 'drum'), (self.bass_drop, 'bass'),
+                                 (self.seg_canvas, 'drum'), (self.seg_canvas_bass, 'bass')):
                 try:
                     widget.drop_target_register(DND_FILES)
                     widget.dnd_bind('<<Drop>>', lambda e, k=kind: self._on_drop(e, k))
@@ -761,8 +822,7 @@ class StudioApp:
         if self.seg_model is not None and self.drum_path:
             self.selected_index = None
             self.segments = []
-            self.segment_click_targets = {}
-            self.seg_canvas.delete('all')
+            self._draw_timeline()   # clears + hides both overlays, revealing the drop zones again
             self._set_status(f"Re-segmenting at sensitivity threshold {snapped:.2f}...", busy=True)
             threading.Thread(target=self._segment_worker, args=(self.drum_path, snapped), daemon=True).start()
 
@@ -811,8 +871,7 @@ class StudioApp:
         self.drum_drop.config(text=os.path.basename(path), foreground='black')
         self.selected_index = None
         self.segments = []
-        self.segment_click_targets = {}
-        self.seg_canvas.delete('all')
+        self._draw_timeline()   # clears + hides both overlays, revealing the drop zones again
         self._set_status(f"Segmenting '{os.path.basename(path)}'...", busy=True)
         threading.Thread(target=self._segment_worker, args=(forced_path, self.seg_threshold_var.get()),
                          daemon=True).start()
@@ -852,38 +911,75 @@ class StudioApp:
 
     # ------------------------------------------------------------ timeline --
     def _draw_timeline(self):
-        self.seg_canvas.delete('all')
+        """Segment results overlap the drum/bass drop zones themselves (same
+        footprint, via place(in_=...)) instead of taking their own row, so they
+        cost no extra vertical space. Both overlays show the same song-structure
+        timeline - it's one set of segments, relevant wherever there's a drop
+        zone for it. place_forget() when there's nothing to show reveals each
+        drop zone's own "Drop ... here" text again."""
         self.segment_click_targets = {}
+        overlays = ((self.seg_canvas, self.drum_drop), (self.seg_canvas_bass, self.bass_drop))
+        for canvas, _target in overlays:
+            canvas.delete('all')
         if not self.segments:
-            self.seg_canvas.config(height=0)
+            for canvas, _target in overlays:
+                canvas.place_forget()
             return
-        self.seg_canvas.config(height=44)
+        for canvas, target in overlays:
+            canvas.place(in_=target, x=0, y=0, relwidth=1.0, relheight=1.0)
         self.root.update_idletasks()
-        canvas_w = max(200, self.seg_canvas.winfo_width())
+        for canvas, target in overlays:
+            self._draw_segments_on(canvas, target)
+
+    def _redraw_timeline_canvas(self, canvas, target):
+        """The canvas itself tracks the drop zone's size dynamically (place()'s
+        relwidth/relheight), but the rectangles drawn INSIDE it are fixed pixel
+        coordinates from whenever they were last drawn - they don't rescale on
+        their own. Bound to each overlay canvas's <Configure> (fires whenever it
+        actually changes size, e.g. the window being resized) so segments always
+        fill the full current width instead of leaving empty space after a
+        resize."""
+        if not self.segments:
+            return
+        canvas.delete('all')
+        self._draw_segments_on(canvas, target)
+
+    def _draw_segments_on(self, canvas, target):
+        # DESIGN: read the TARGET's size, not the canvas's own winfo_width/height.
+        # place(relwidth/relheight=1.0) sizes the canvas to match target, but right
+        # after place() the canvas's own geometry hasn't necessarily been re-queried
+        # yet (a one-frame lag), while target has been stably packed since startup -
+        # so target's size is the reliable source of truth for how big to draw.
+        canvas_w = max(200, target.winfo_width())
+        canvas_h = max(24, target.winfo_height())
         total_bars = sum(s.end_bar - s.start_bar for s in self.segments)
         if total_bars <= 0:
             return
+        y0, y1 = 2, canvas_h - 2
+        mid_y = canvas_h / 2
+        is_drum_canvas = (canvas is self.seg_canvas)
         x = 0
         for i, seg in enumerate(self.segments):
             length = seg.end_bar - seg.start_bar
             w = max(SEGMENT_MIN_RECT_WIDTH_PX, round(canvas_w * length / total_bars))
             color = SEGMENT_COLORS[i % len(SEGMENT_COLORS)]
             selected = (i == self.selected_index)
-            rect = self.seg_canvas.create_rectangle(
-                x, 2, x + w, 40, fill=color,
+            rect = canvas.create_rectangle(
+                x, y0, x + w, y1, fill=color,
                 outline=SELECTED_OUTLINE_COLOR if selected else 'white',
                 width=SEGMENT_OUTLINE_WIDTH_SELECTED if selected else SEGMENT_OUTLINE_WIDTH_NORMAL,
                 tags=(f'seg{i}',))
             label = f"{seg.start_bar+1}-{seg.end_bar}"
             if w > 28:
-                self.seg_canvas.create_text(x + w / 2, 21, text=label, fill='white',
-                                            font=('', 8), tags=(f'seg{i}',))
+                canvas.create_text(x + w / 2, mid_y, text=label, fill='white',
+                                   font=('', 8), tags=(f'seg{i}',))
             if seg.is_customized():
-                self.seg_canvas.create_oval(x + w - 10, 4, x + w - 2, 12,
-                                            fill=CUSTOMIZED_MARKER_COLOR, outline='',
-                                            tags=(f'seg{i}',))
-            self.seg_canvas.tag_bind(f'seg{i}', '<Button-1>', lambda e, idx=i: self._on_segment_selected(idx))
-            self.segment_click_targets[i] = {'rect': rect, 'x0': x, 'x1': x + w}
+                canvas.create_oval(x + w - 10, y0 + 2, x + w - 2, y0 + 10,
+                                   fill=CUSTOMIZED_MARKER_COLOR, outline='',
+                                   tags=(f'seg{i}',))
+            canvas.tag_bind(f'seg{i}', '<Button-1>', lambda e, idx=i: self._on_segment_selected(idx))
+            if is_drum_canvas:
+                self.segment_click_targets[i] = {'rect': rect, 'x0': x, 'x1': x + w}
             x += w
 
     def _on_segment_selected(self, idx):
@@ -1318,6 +1414,88 @@ class StudioApp:
         threading.Thread(target=self._audition_worker, args=(path,), daemon=True).start()
 
     def _audition_worker(self, path):
+        try:
+            self.player.play(path, on_finished=lambda err: self.root.after(
+                0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
+        except Exception as exc:
+            msg = _report_error(f"auditioning '{path}'", exc)
+            self.root.after(0, lambda: self._set_status(msg))
+
+    def _on_audition_raw_both(self):
+        """Play the selected segment's raw drum + bass together, perfectly in
+        sync (see audition_both_to_temp) - bass is optional (drum-only if no
+        bass file is loaded yet)."""
+        seg = self._current_segment()
+        if seg is None:
+            messagebox.showinfo("Select a segment", "Select a segment first (click one in "
+                                "the timeline above).")
+            return
+        if self.player is None:
+            return
+        if not self.drum_path:
+            messagebox.showinfo("Nothing to play", "Load a drum MIDI file first.")
+            return
+        self._set_status(f"Auditioning segment {seg.index+1} (drum+bass)...", busy=True)
+        threading.Thread(target=self._audition_raw_both_worker,
+                         args=(self.drum_path, self.bass_path, seg.start_sec, seg.end_sec),
+                         daemon=True).start()
+
+    def _audition_raw_both_worker(self, drum_path, bass_path, start_sec, end_sec):
+        try:
+            path = audition_both_to_temp(drum_path, bass_path, start_sec, end_sec, self.temp_dir)
+        except Exception as exc:
+            msg = _report_error("building combined drum+bass audition slice", exc)
+            self.root.after(0, lambda: self._set_status(msg))
+            return
+        self.playing_path = path
+        try:
+            self.player.play(path, on_finished=lambda err: self.root.after(
+                0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
+        except Exception as exc:
+            msg = _report_error(f"auditioning '{path}'", exc)
+            self.root.after(0, lambda: self._set_status(msg))
+
+    def _on_audition_raw_drum(self):
+        self._on_audition_raw_segment('drum')
+
+    def _on_audition_raw_bass(self):
+        self._on_audition_raw_segment('bass')
+
+    def _on_audition_raw_segment(self, kind):
+        """Play the currently selected segment's RAW (unprocessed) span straight
+        from the source file, forced to a drum kit or bass sound respectively -
+        regardless of what channel/program the source file itself used - so it's
+        always audible as intended even before any phase has run."""
+        seg = self._current_segment()
+        if seg is None:
+            messagebox.showinfo("Select a segment", "Select a segment first (click one in "
+                                "the timeline above).")
+            return
+        if self.player is None:
+            return
+        source_path = self.drum_path if kind == 'drum' else self.bass_path
+        if not source_path:
+            messagebox.showinfo("Nothing to play", f"Load a {kind} MIDI file first.")
+            return
+        self._set_status(f"Auditioning segment {seg.index+1} ({kind})...", busy=True)
+        threading.Thread(target=self._audition_raw_worker,
+                         args=(kind, source_path, seg.start_sec, seg.end_sec), daemon=True).start()
+
+    def _audition_raw_worker(self, kind, source_path, start_sec, end_sec):
+        try:
+            if kind == 'drum':
+                path, _, _ = slice_midi_to_temp(source_path, start_sec, end_sec,
+                                                self.temp_dir, drums_only=True)
+            else:
+                # program=33 (Electric Bass, finger) - same GM program the render
+                # step's own bass_inst uses, so this sounds like the final output.
+                path, _, _ = slice_midi_to_temp(source_path, start_sec, end_sec,
+                                                self.temp_dir, drums_only=False, program=33)
+        except Exception as exc:
+            msg = _report_error(f"slicing segment for {kind} audition", exc)
+            self.root.after(0, lambda: self._set_status(msg))
+            return
+        self.playing_path = path
         try:
             self.player.play(path, on_finished=lambda err: self.root.after(
                 0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
