@@ -1,37 +1,29 @@
-(# drum_bass_human
+# drum_bass_human
 
-Tools for humanizing drum MIDI (and syncing bass to it), finding similar
-grooves in a library, and auto-detecting theme/section boundaries in a song.
+This project has tools that:
+- Make drum MIDI sound more human (small changes in timing and volume, like a real drummer).
+- Make a bass MIDI file match (sync to) the humanized drums.
+- Find similar-sounding grooves in your MIDI library.
+- Find song section changes (like verse, chorus) automatically.
 
-## Files
+## Files in this project
 
-- **config.py** - constants/defaults used by `drum_bass_studio.py`
-- **drum_humanizer_v3.py** - Model that learns human drum feel (timing +
-  velocity) from a MIDI library and applies it to stiff MIDI.
-  (modes: `cache`, `train`, `infer`).
-- **drum_theme_segmentation.py** - detects section boundaries are (modes `dataset`, `train`, `infer`).
-- **find_similar_grooves.py** - given a query MIDI, ranks your library by how
-  similar it feels (rhythm/velocity/density/tempo). (modes: `index`, `query`).
-- **drum_bass_studio.py** - main all-in-one app. Combines the humanizer +
-  segmentation model + bass sync + per-segment groove search (via
-  `find_similar_grooves.py`) into one window. Segment, humanize each segment,
-  tweak rush/drag, sync bass, optionally swap in a similar library groove,
-  render. Auditions play through Windows' built-in GS Wavetable synth (see
-  `MidiPlayer` in the file - Windows only).
-- **parse_midi_library.py** - standalone housekeeping tool for a large *external*
-  MIDI sample library (not part of the humanizer pipeline itself -
-  tidies up a folder of purchased/downloaded MIDI packs). Prunes unwanted
-  genres, dedupes exact-duplicate files, flattens the folder structure, and
-  sorts long files out by length.
+- `config.py` — Settings and default values used by `drum_bass_studio.py`.
+- `drum_humanizer_v3.py` — A model that learns how a real drummer plays (timing and velocity) from your MIDI library. It can then add that human feel to a stiff (robotic) MIDI file. Modes: `cache`, `train`, `infer`.
+- `drum_theme_segmentation.py` — Finds where a song changes section (like verse to chorus). Modes: `dataset`, `train`, `infer`.
+- `find_similar_grooves.py` — Takes one groove (a short MIDI file) and searches your library for similar-sounding grooves (by rhythm, velocity, note density, tempo). Modes: `index`, `query`.
+- `drum_bass_studio.py` — The main app, with a window (UI). It combines everything above: split a song into segments, humanize each segment, adjust the rush/drag feel, sync the bass, swap in a similar groove if you want, and render the final song. Sound only plays through Windows' built-in synth (see `MidiPlayer` in the file — Windows only).
+- `parse_midi_library.py` — A separate tool that cleans up a big folder of MIDI files you downloaded or bought. It is not part of the main humanizer pipeline. It removes packs you don't want, deletes exact duplicate files, makes the folder structure flat and simple, and sorts long files by length.
 
-## 1. Set up environment
+## Step 1: Set up your computer
+
 ```bash
 python3 -m venv dbh
 source dbh/bin/activate
 pip install -r requirements.txt
 ```
 
-or
+On Windows, use this instead:
 
 ```bash
 python3 -m venv dbh
@@ -39,438 +31,277 @@ dbh\Scripts\activate.bat
 pip install -r requirements.txt
 ```
 
+Note about `tkinter`: `drum_bass_studio.py` needs `tkinter`, but you cannot install it with `pip`. It comes from your operating system.
+- On Linux: if `import tkinter` fails, run `sudo apt install python3-tk`.
+- On Windows: the normal Python installer from python.org (or `winget install Python.Python.3.12`) already includes `tkinter`. You don't need to do anything extra. (Only exception: Python from the Microsoft Store does NOT include it. If you use that, reinstall Python from python.org or winget, and check the box for "tcl/tk and IDLE" during install.)
 
+## Step 2: Clean your MIDI library (optional, but a good first step)
 
-Note: `tkinter` (needed by `drum_bass_studio.py`) is
-not in requirements.txt - it's not pip-installable, comes from the system.
-On Linux, if `import tkinter` fails: `sudo apt install python3-tk`.
-On Windows, the official python.org installer (and `winget install
-Python.Python.3.12`) bundles Tcl/Tk by default, so `tkinter` just works out of
-the box - no separate install step. (Only exception: Python from the
-Microsoft Store excludes it: reinstall via python.org/winget with the "tcl/tk
-and IDLE" optional feature checked.)
+If you have a big folder of downloaded or bought MIDI files, use `parse_midi_library.py` to clean it up before using it with the other tools. Full details are in Step 7 below. Quick example:
 
-## 2. drum_theme_segmentation.py - dataset -> train -> infer
 ```bash
-# a) build the (synthetic) training dataset from a MIDI library
-python drum_theme_segmentation.py --mode dataset --data_dir ./data --cache ./cache/segments.pkl --num_samples 1000
+dbh\Scripts\activate.bat
 
-# b) train
-python drum_theme_segmentation.py --mode train --cache ./cache/segments.pkl --run_name seg_v1 --epochs 100 --windows_per_sample 8
-
-# c) run on a real song, print predicted boundary measures
-#    (use the threshold the training run's sweep recommended, not necessarily 0.5)
-python drum_theme_segmentation.py --mode infer --checkpoint ./checkpoints/seg_v1/best.pt --input my_song.mid --threshold 0.5
-```
-
-### Getting a decent val_F1 out of the segmentation model
-
-The knobs that actually moved the needle, roughly in order of payoff:
-
-| Flag | Why it matters |
-|---|---|
-| `--windows_per_sample` (default 8) | A cached sample averages ~9k notes but one window only covers `--max_seq_len` of them, so it takes ~17 windows to tile one sample. At the old fixed 1-window-per-sample the model saw **~5% of the cache per epoch** - it was data-*starved*, not data-poor. This is free extra training signal: no cache rebuild, no extra disk. |
-| `--epochs` / `--early_stop_patience` (default 15) | `OneCycleLR` anneals the LR across *all* `--epochs`, and most of the final gain is in that low-LR tail. Too-tight patience kills the run mid-schedule (seen: stopped at epoch ~50/100 with lr still at 2.2e-4, only 28% into the decay). Set `--epochs` to what you actually intend to run. |
-| `--max_seq_len` (default 512) / `--batch_size` | To call a bar a boundary the model has to compare it against the **previous theme block**. At 512 notes a window spans only ~2x one block, so near a boundary it often sees just a fragment of what came before. 1024 gives ~4 blocks of context - but attention is O(n^2), so drop `--batch_size` to 8 alongside it on a 4GB card. |
-| `--d_model` / `--num_layers` | Defaults (128 / 3) are ~500k params and epochs take seconds on a GPU. Plenty of headroom to go to 256 / 6. |
-| `--num_samples` (dataset mode) | Only worth raising *after* the above - window coverage is the cheaper lever. Costs ~240MB of cache per 1000 samples. Whether more samples add genuinely new material depends on how many name-families your library has: the dataset step prints this (a large library can have tens of thousands, in which case there is a lot left to draw on). |
-| `--pos_weight` (default 8.0) | Class-imbalance weight. Compare it against the real imbalance - if training shows precision **below** recall the model is over-predicting, so lower it. |
-
-Every training run ends with a **validation threshold sweep** over the best
-checkpoint. `val_F1` during training is scored at a fixed 0.5 cutoff, which is
-rarely the F1-optimal operating point when positives are rare (~1 boundary per
-17 measure-start notes) - the sweep reports the threshold that actually
-maximizes F1, and that is the number to pass to `--threshold` at infer time.
-
-## 2. Parse
-```bash
-dbh\Scripts\Activate
-
-# cleanup (delete unwanted genres/dupes/ViR2/house) — dry run first
+# clean up (delete unwanted genres/duplicates) - dry run first, changes nothing yet
 python parse_midi_library.py ".\data" --execute
 
-# flatten into Company/Genre structure
+# make the folder structure flat and simple
 python parse_midi_library.py ".\data" --flatten --execute
 
 # sort long files into _songs/ and _g48/
 python parse_midi_library.py ".\data" --move-by-measures --execute
 
-# sort remaining 25-48 bar files into _g24/
+# sort the remaining 25-48 bar files into _g24/
 python parse_midi_library.py ".\data" --move-g24 --execute
 
 python parse_midi_library.py ".\data" --verify-midi --execute
 python parse_midi_library.py ".\data" --erase-junk --execute
 python parse_midi_library.py ".\data" --erase-ambiguous --execute
-
-python drum_humanizer_v3.py --mode cache --data_dir ".\data" --cache cache/samples.pkl
-
 ```
 
+## Step 3: drum_theme_segmentation.py — find song sections
 
-## 3. drum_humanizer_v3.py - build cache -> train -> infer
+This tool has 3 modes. Run them in this order: `dataset`, then `train`, then `infer`.
+
 ```bash
-# build a training cache from a folder of MIDI files (once)
+# a) build training data from your MIDI library
+python drum_theme_segmentation.py --mode dataset --data_dir ./data --cache ./cache/segments.pkl --num_samples 1000
+
+# b) train the model
+python drum_theme_segmentation.py --mode train --cache ./cache/segments.pkl --run_name seg_v1 --epochs 100 --windows_per_sample 8
+
+# c) run on a real song and print where it thinks each section starts
+#    (use the threshold number training suggests, not always 0.5)
+python drum_theme_segmentation.py --mode infer --checkpoint ./checkpoints/seg_v1/best.pt --input my_song.mid --threshold 0.5
+```
+
+### How to get a better score (val_F1) from this model
+
+Here is what helps the most, from biggest effect to smallest:
+
+| Setting | Why it helps |
+|---|---|
+| `--windows_per_sample` (default 8) | One training example has about 9,000 notes, but the model only looks at `--max_seq_len` notes at a time. So it needs about 17 "looks" (windows) to see one whole example. With the old setting of 1 window per example, the model only saw about 5% of the data each epoch (training round). This setting fixes that for free — no need to rebuild the cache or use more disk space. |
+| `--epochs` and `--early_stop_patience` (default 15) | The learning rate slowly goes down across all `--epochs`. Most of the improvement happens near the end, when the learning rate is low. If `--early_stop_patience` is too small, training stops too early, before that improvement happens. Set `--epochs` to the number you actually plan to run. |
+| `--max_seq_len` (default 512) and `--batch_size` | To decide if a bar starts a new section, the model must compare it to the section before it. At 512 notes, the model can only see about 2 sections at once, so near a boundary it often only sees a small piece of what came before. Using 1024 lets it see about 4 sections — but this uses much more memory (the cost grows fast, not just double), so also lower `--batch_size` to 8 if you have a small graphics card (4GB). |
+| `--d_model` and `--num_layers` | The default (128 / 3) is a small model (about 500,000 numbers) and trains fast on a GPU. You can safely try a bigger model: 256 / 6. |
+| `--num_samples` (dataset mode) | Only raise this after trying the settings above — they help more for less cost. Every 1000 samples uses about 240MB of disk space. Whether more samples actually help depends on how many different song "families" are in your library (the tool prints this number when it builds the dataset). |
+| `--pos_weight` (default 8.0) | This controls how much the model cares about rare "section start" notes. Check your training output: if precision is lower than recall, the model is guessing "section start" too often — try a lower number. |
+
+After training finishes, the tool automatically tests many threshold values on the best checkpoint (model file) and tells you which one scores best. The score shown during training always uses a fixed threshold of 0.5, but that number is usually not the best choice, because "section start" notes are rare in the data. Use the number the tool suggests, not 0.5, when you run `--mode infer`.
+
+## Step 4: drum_humanizer_v3.py — make MIDI sound human
+
+3 modes, run in order: `cache`, then `train`, then `infer`.
+
+```bash
+# build a training cache from a folder of MIDI files (only needed once)
 python drum_humanizer_v3.py --mode cache --data_dir "./data" --cache ./cache/samples.pkl
 
-# train a model on that cache (--model_size small - see the size-tradeoff note below
-# for why: 2.2x faster than the 'base' default at a real capacity cost, benchmarked)
+# train a model using that cache
+# (--model_size small is recommended: 2.2x faster than the default "base" size,
+#  with only a small drop in quality - see the size table below)
 python drum_humanizer_v3.py --mode train --cache cache/samples.pkl --run_name v1 --model_size small --epochs 100
 
-# quick smoke test with no real data:
+# quick test with fake data, no real MIDI files needed
 python drum_humanizer_v3.py --mode train --synthetic --epochs 3 --run_name smoke
 
-# humanize a loop with the trained checkpoint
+# use the trained model to humanize a MIDI loop
 python drum_humanizer_v3.py --mode infer --checkpoint checkpoints/v1/best.pt --input my_loop.mid --output my_loop_human.mid --strength 0.85
 ```
 
-### Pretrained model (skip training to just try it)
+### Pretrained model (try it now, without training)
 
-`--mode grid_search` and `drum_bass_studio.py` both know about a `pretrained/`
-folder holding the current best humanizer checkpoint, so trying the tool
-doesn't require training one yourself first:
+You don't have to train your own model just to try this tool. A ready-made model is kept in the `pretrained/` folder:
 
-- `pretrained/humanizer_best.pt` - the winning run's weights + architecture
-  config only (no optimizer/scheduler state - it's inference-only, not
-  resumable for further training). `pretrained/humanizer_metadata.json`
-  records which run it came from, its val_loss, and the data/recipe
-  fingerprint it's comparable against.
-- `--mode grid_search` copies its winning run here automatically every time
-  it finishes, overwriting whatever was there before.
-- `--mode infer` and `drum_bass_studio.py` both default to
-  `pretrained/humanizer_best.pt` automatically whenever `--checkpoint` /
-  "Load..." isn't given explicitly.
+- `pretrained/humanizer_best.pt` — the best model found so far. It only has the model's learned numbers (weights), not the full training state, so you can use it but not continue training it further. `pretrained/humanizer_metadata.json` has info about how it was trained.
+- `--mode grid_search` automatically saves its best result here, replacing the old file each time.
+- `--mode infer` and `drum_bass_studio.py` both use `pretrained/humanizer_best.pt` automatically if you don't give your own checkpoint with `--checkpoint` or the "Load..." button.
 
-**This folder is intentionally NOT committed to git** - a ~250MB checkpoint
-doesn't belong in git history (see `knowledge.md`). Instead it's shared via a
-Google Drive folder, and `download_pretrained.py` fetches it automatically:
+**This folder is NOT saved in git** — a file of about 250MB does not belong in git history (see `knowledge.md`). Instead, it is shared using Google Drive, and the script `download_pretrained.py` downloads it for you:
 
 ```bash
-python download_pretrained.py             # fetch only if missing locally
-python download_pretrained.py --force     # re-fetch even if already present
+python download_pretrained.py             # download only if the file is missing
+python download_pretrained.py --force     # download again, even if the file is already there
 ```
 
-- `drum_bass_studio.py` calls this automatically at startup: if
-  `pretrained/humanizer_best.pt` isn't there yet (e.g. right after cloning
-  this repo on a new machine), it fetches it from Drive before the window
-  opens. Every later launch finds the file already there and skips the
-  network check entirely - this is a one-time bootstrap cost, not a
-  per-launch delay.
-- Needs the `gdown` package (already in `requirements.txt`) - a plain
-  `requests.get()` on a Drive file URL chokes on Google's
-  virus-scan-warning interstitial for a file this size; `gdown` handles it.
-- Shared folder: https://drive.google.com/drive/folders/1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye
-  - Matched by **filename** inside the folder, not a hardcoded file id, so
-    replacing it there with a better model is picked up automatically with
-    no code change.
-  - This folder needs a real Google account to write to (Drive's "anyone
-    with the link can edit" is a UI/ACL permission, not an anonymous-upload
-    API) - uploading a new model there is a manual step, not automated by
-    anything in this repo.
-- If `gdown` isn't installed, Drive is unreachable, or nothing's been
-  uploaded there yet: both `--mode infer` and the UI fall back cleanly to
-  "no pretrained model" and just need an explicit `--checkpoint` / manual
-  "Load..." instead - this is a convenience, not a hard dependency.
+- `drum_bass_studio.py` runs this automatically when it starts. If `pretrained/humanizer_best.pt` is missing (for example, right after you download this project), it fetches the file before opening the window. After that first time, it finds the file already there and skips checking the internet — so only the very first startup is a little slower.
+- This needs the `gdown` package (already listed in `requirements.txt`). A normal download request does not work well with Google Drive's big-file warning page — `gdown` handles that correctly.
+- Shared folder link: https://drive.google.com/drive/folders/1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye
+  - The download matches the file by **name**, not by a fixed ID. So if someone uploads a better model with the same name, you get it automatically, with no code change needed.
+  - Uploading a new file to this folder needs your own Google account with edit access. This is a manual step — nothing in this project does it for you.
+- If `gdown` is not installed, or Google Drive cannot be reached, or nothing has been uploaded there yet: both `--mode infer` and the app just continue without a pretrained model. You then need to give your own checkpoint with `--checkpoint` or "Load...".
 
-
-## 4. find_similar_grooves.py - index -> query
+## Step 5: find_similar_grooves.py — find similar grooves
 
 ```bash
-# a) index your MIDI library once
+# a) build a search index from your MIDI library (do this once)
 python find_similar_grooves.py --mode index --data_dir ./data \
        --cache ./cache/groove_index.pkl
 
-# b) query: rank the library against one groove
+# b) search: find grooves similar to one file
 python find_similar_grooves.py --mode query --cache cache/groove_index.pkl \
        --query "/path/to/some_groove.mid" --top_k 15
 ```
 
-## 5. Running the UI
+## Step 6: Run the app (the main window)
 
 ```bash
-# Drum + Bass Humanization Studio (needs trained checkpoints from
-# drum_humanizer_v3.py and drum_theme_segmentation.py; groove search needs a
-# cache from find_similar_grooves.py --mode index)
+# Drum + Bass Humanization Studio
+# (needs trained checkpoints from drum_humanizer_v3.py and drum_theme_segmentation.py;
+#  groove search needs an index from find_similar_grooves.py --mode index)
 python drum_bass_studio.py
 ```
 
-Just opens a window - drag/drop or Browse for the MIDI file(s), no other args
-needed. Studio's humanizer model doesn't need a manual "Load..." either - it
-auto-fetches and auto-selects the bundled pretrained model on first launch
-(see "Pretrained model" under section 3 above).
+This just opens a window. Drag and drop your MIDI file(s) into it, or click to browse — no other steps needed. You also don't need to load the humanizer model by hand: the app downloads and picks the ready-made model automatically the first time you run it (see "Pretrained model" in Step 4).
 
-## 6. parse_midi_library.py - external MIDI library housekeeping
+## Step 7: parse_midi_library.py — clean up a big MIDI folder (full details)
 
-A standalone script for cleaning up a large external folder of purchased/
-downloaded MIDI packs (mine lives at `/media/kapost/Schemsis/data`, an
-external drive - point it at wherever the equivalent folder is on this
-machine). Not part of the humanizer pipeline - just keeps the raw MIDI
-source library tidy before I feed any of it into `drum_humanizer_v3.py`'s
-`--mode cache` step.
+This is a separate tool for cleaning a big folder of MIDI files you downloaded or bought. It is not part of the humanizer itself — it just keeps your raw MIDI files tidy before you use them with `drum_humanizer_v3.py --mode cache`. (Example folder from the original setup: `/media/kapost/Schemsis/data`, an external drive — use whatever folder path is correct on your own computer.)
 
-It has **four separate modes**, picked with a flag. Only one mode runs per
-invocation. Every mode defaults to a **dry run** (prints what it would do,
-changes nothing) - pass `--execute` to actually touch files. Renaming/moving
-modes also support `--preview N` to sample N random results without a full
-dry-run listing.
+It has **4 modes**. You pick one mode at a time using a flag.
 
-**Arguments (all modes):**
+By default, every mode is a **dry run**: it only prints what it *would* do and changes nothing. Add `--execute` to really change files. The rename/move modes also support `--preview N`, which shows N random example results instead of a full dry-run list.
 
-| Argument | Meaning |
+**Options for every mode:**
+
+| Option | What it means |
 |---|---|
-| `base_dir` (positional, required) | Path to the library root, e.g. `"/media/kapost/Schemsis/data"` |
-| `--execute` | Actually delete/rename/move files. Without it, every mode is a dry run. |
-| `--preview N` | (flatten / move-by-measures / move-g24 only) Print N randomly sampled before -> after results instead of doing a full run. Implies dry run unless combined with `--execute`. |
-| `--seed N` | Random seed for `--preview` sampling, so repeated previews are reproducible. |
-| `--keep-format {sd3,ezd}` | (default mode only) Which plugin-format copy to keep when a groove was shipped for both Superior Drummer and EZdrummer/EZX. Default `sd3`. |
-| `--flatten` | Switch to flatten mode (see below). |
-| `--move-by-measures` | Switch to move-by-measures mode (see below). |
-| `--move-g24` | Switch to move-g24 mode (see below). |
+| `base_dir` (required, no flag needed) | The folder path to your MIDI library, for example `"/media/kapost/Schemsis/data"` |
+| `--execute` | Really delete/rename/move files. Without this, nothing changes (dry run). |
+| `--preview N` | (flatten / move-by-measures / move-g24 modes only) Show N random example results instead of a full list. This also means "dry run", unless you also add `--execute`. |
+| `--seed N` | A number that controls the random preview results, so you can repeat the same preview again. |
+| `--keep-format {sd3,ezd}` | (default mode only) When one groove exists in two plugin formats (Superior Drummer or EZdrummer/EZX), which one to keep. Default is `sd3`. |
+| `--flatten` | Use flatten mode (see below). |
+| `--move-by-measures` | Use move-by-measures mode (see below). |
+| `--move-g24` | Use move-g24 mode (see below). |
 
-### Mode 1: default (no mode flag) - cleanup
+### Mode 1: default (no extra flag) — cleanup
 
 ```bash
 python parse_midi_library.py "/media/kapost/Schemsis/data"            # dry run
-python parse_midi_library.py "/media/kapost/Schemsis/data" --execute  # for real
+python parse_midi_library.py "/media/kapost/Schemsis/data" --execute  # really do it
 ```
 
-Runs 7 phases in order: delete the ViR2 pack (unconfirmed real-drummer
-provenance), delete specific unwanted genres (punk, jungle, rave, cha cha,
-marcha/rancho, afrobeat, NWOBHM, EDM, trance, industrial), delete house-genre
-folders + the Groove Monkee Electronic pack, dedupe exact-duplicate files by
-content hash (keeping the `--keep-format` plugin edition, or the `@`-numbered
-canonical folder for plain redundant copies), remove newly-empty folders,
-delete every `header` marker file, remove newly-empty folders again.
-Library-metadata marker files (`header`, `Aversion`, `kitpieces`, `midiDB`,
-`.dummy`, and anything 0 bytes) are protected from the dedup step since
-Toontrack/EZdrummer/BFD need their own local copy per pack folder to
-recognize it as valid content.
+Does 7 steps, in this order: delete the "ViR2" pack (not sure it's from a real drummer), delete some genres you don't want (punk, jungle, rave, cha cha, marcha/rancho, afrobeat, NWOBHM, EDM, trance, industrial), delete house-genre folders and the Groove Monkee Electronic pack, delete exact duplicate files (same content) — keeping the format you chose with `--keep-format` — remove folders that are now empty, delete every `header` marker file, then remove empty folders again. Special files like `header`, `Aversion`, `kitpieces`, `midiDB`, `.dummy`, and any 0-byte file are never removed by the duplicate check, because Toontrack/EZdrummer/BFD need their own copy in each pack folder to work correctly.
 
-### Mode 2: `--flatten` - rename into Company/Genre structure
+### Mode 2: `--flatten` — rename files into a simple Company/Genre structure
 
 ```bash
 python parse_midi_library.py "/media/kapost/Schemsis/data" --flatten --preview 20
 python parse_midi_library.py "/media/kapost/Schemsis/data" --flatten --execute
 ```
 
-Rewrites every file from its deep, numbered, "@"-riddled original path into
-a flat `Company/Genre/renamed_file.ext` structure, e.g.:
+Moves every file from its old, deep, complicated path into a simple `Company/Genre/renamed_file.ext` path. Example:
 
 ```
 data/210@GROOVE_MONKEE_BLUES/21@078 SLOW BLUES A/078 Slow Blues Hats (8) F1 S.mid
   -> data/GROOVE/SLOW BLUES A/groove_Slow_Blues_Hats_(8)_F1S.mid
 ```
 
-Folds as much of the original path into the filename as it can without
-repeating what's already implied (capped at 4 folder-lineage segments, with
-cross-segment word dedup and a library of word abbreviations like
-`straight`->`s`, `variation`->`v`, `fills`->`f`). Never overwrites - collisions
-get an incrementing `_2`, `_3`, ... suffix. Verifies the total file count is
-unchanged after `--execute`.
+It puts as much useful info from the old path into the new filename as it can, without repeating the same word twice (up to 4 folder levels, using short forms for common words, like `straight`->`s`, `variation`->`v`, `fills`->`f`). It never overwrites a file — if two files would get the same new name, it adds `_2`, `_3`, and so on. After `--execute`, it checks that the total number of files did not change.
 
-### Mode 3: `--move-by-measures` - sort long files into _songs/ and _g48/
+### Mode 3: `--move-by-measures` — sort long files into `_songs/` and `_g48/`
 
 ```bash
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-by-measures --preview 20
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-by-measures --execute
 ```
 
-Counts every `.mid`/`.midi` file's length in bars (via `pretty_midi`'s
-downbeat detection) and moves it into one of two new top-level folders,
-first match wins:
-1. `_songs/` - "song" or "songs" appears anywhere in the file's old path
-   (case-insensitive) AND it's longer than 64 bars.
-2. `_g48/` - longer than 48 bars (checked only if #1 didn't match).
+Counts how many bars each `.mid`/`.midi` file has (using `pretty_midi`), then moves it to one of two new folders, checked in this order:
+1. `_songs/` — if the old path anywhere contains the word "song" or "songs" (upper/lower case doesn't matter) AND the file is longer than 64 bars.
+2. `_g48/` — if the file is longer than 48 bars (only checked if rule 1 did not match).
 
-The old path is folded into the new filename so nothing about where a file
-came from is lost once it's sitting in a flat folder.
+The old path is added into the new filename, so you don't lose the information about where the file came from.
 
-### Mode 4: `--move-g24` - sort remaining 25-48 bar files into _g24/
+### Mode 4: `--move-g24` — sort remaining 25-48 bar files into `_g24/`
 
 ```bash
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-g24 --preview 20
 python parse_midi_library.py "/media/kapost/Schemsis/data" --move-g24 --execute
 ```
 
-Same idea, simpler: every `.mid`/`.midi` file **not already under `_songs/` or
-`_g48/`** that's longer than 24 bars moves into a new top-level `_g24/` folder.
-Since mode 3 already relocated everything over 48 bars, this only picks up
-the 25-48 bar range. Run mode 3 first if starting from scratch - mode 4
-explicitly excludes `_songs/` and `_g48/` from its scan either way.
+Same idea, simpler: every `.mid`/`.midi` file that is **not already in `_songs/` or `_g48/`**, and is longer than 24 bars, moves into a new `_g24/` folder. Since mode 3 already moved everything over 48 bars, this mode only picks up files with 25 to 48 bars. If starting from scratch, run mode 3 first — but mode 4 always skips `_songs/` and `_g48/` anyway, just to be safe.
 
-**Suggested order on a fresh copy of the library:** mode 1 (cleanup) -> mode 2
-(flatten) -> mode 3 (move-by-measures) -> mode 4 (move-g24). Each mode
-defaults to a dry run, so it's safe to just run each one first and read the
-output before adding `--execute`.
+**Suggested order on a brand-new library:** mode 1 (cleanup) -> mode 2 (flatten) -> mode 3 (move-by-measures) -> mode 4 (move-g24). Every mode is a dry run by default, so it's safe to run each one first, read what it says, and add `--execute` only once you're happy with it.
 
-## Quick order of operations (from nothing)
+## Quick summary: order of steps from zero
 
-1. Set up venv + install deps (step 1 above).
-2. Build a groove-similarity index (`find_similar_grooves.py --mode index`) if
-   I want to use Groove Finder.
-3. Build the humanizer cache + train it (`drum_humanizer_v3.py` cache -> train)
-   if I want fresh/better humanization.
-4. Build the segmentation dataset + train it (`drum_theme_segmentation.py`
-   dataset -> train) if I want fresh/better auto-segmentation.
-5. Open `drum_bass_studio.py` for the actual humanize-a-song workflow (its
-   per-segment groove search covers finding similar grooves too), or use
-   `find_similar_grooves.py --mode query` from the CLI for a one-off lookup.
+1. Set up the environment and install everything (Step 1).
+2. Build a groove-search index (`find_similar_grooves.py --mode index`) if you want to use "find similar grooves".
+3. Build the humanizer cache and train it (`drum_humanizer_v3.py` cache -> train) if you want fresh or better humanization — or just use the ready-made model (see Step 4).
+4. Build the segmentation dataset and train it (`drum_theme_segmentation.py` dataset -> train) if you want fresh or better automatic section detection.
+5. Open `drum_bass_studio.py` for the full workflow (it can also search for similar grooves), or use `find_similar_grooves.py --mode query` from the command line for a single one-off search.
 
-## Notes (things that aren't obvious from the commands alone)
+## Extra notes (easy to miss, but useful)
 
-**Caches vs. checkpoints - these are NOT interchangeable:**
+**Caches and checkpoints are different things — don't mix them up:**
 
-| Producer | File it makes | Who actually reads it |
+| Tool/mode that makes it | File it creates | What actually reads this file |
 |---|---|---|
 | `drum_humanizer_v3.py --mode cache` | `cache/samples.pkl` (raw training data) | only `drum_humanizer_v3.py --mode train` |
 | `drum_humanizer_v3.py --mode train` | `checkpoints/<run_name>/best.pt` | `drum_humanizer_v3.py --mode infer` **and** `drum_bass_studio.py` |
 | `find_similar_grooves.py --mode index` | `cache/groove_index.pkl` | `find_similar_grooves.py --mode query` **and** `drum_bass_studio.py`'s groove search |
 
-- `drum_bass_studio.py` never builds or touches a cache. It only needs a
-  trained **checkpoint** (`.pt`) from `drum_humanizer_v3.py` and one from
-  `drum_theme_segmentation.py`, picked via its "browse for checkpoint" buttons.
-  If I haven't trained yet, Studio has nothing to load.
-- At `infer` time, `drum_humanizer_v3.py` reads the model architecture
-  straight out of the checkpoint file - no need to pass `--model_size` etc.
-  again when humanizing.
+- `drum_bass_studio.py` never builds a cache by itself. It only needs a trained **checkpoint** (a `.pt` file) from `drum_humanizer_v3.py`, and one from `drum_theme_segmentation.py`. You pick these with its "browse for checkpoint" buttons. If you haven't trained a model yet, there is nothing for Studio to load (unless you use the ready-made pretrained one — see Step 4).
+- When you run `--mode infer`, `drum_humanizer_v3.py` reads the model's shape/size directly from the checkpoint file. You don't need to pass `--model_size` again.
 
-**Rebuild triggers - some CLI flags are baked into the cache/index at build time,**
-**not applied later at query/train time:**
-- `drum_humanizer_v3.py --mode cache`: `--no_quality_filter`,
-  `--min_velocity_std/range`, `--min_offset_std/range` only take effect when
-  building the cache. Changing them later means rebuilding `cache/samples.pkl`.
-- `find_similar_grooves.py --mode index`: `--min_notes` and the per-instrument
-  velocity floors are baked into the index. Changing them means rebuilding
-  with `--mode index` again - a `--mode query` re-run won't pick up the change.
+**Some settings are locked in when you build the cache/index — changing them later does nothing until you rebuild:**
+- `drum_humanizer_v3.py --mode cache`: `--no_quality_filter`, `--min_velocity_std/range`, `--min_offset_std/range` only apply when you build the cache. If you change them, you must rebuild `cache/samples.pkl`.
+- `find_similar_grooves.py --mode index`: `--min_notes` and the per-instrument volume limits are locked into the index when you build it. To change them, run `--mode index` again — running `--mode query` again will NOT pick up the change.
 
-**Other things worth remembering:**
-- `--synthetic` on `drum_humanizer_v3.py` lets me smoke-test training
-  end-to-end with fake data, no MIDI library needed - useful to sanity check
-  a code change before waiting on a real cache build. `drum_theme_segmentation.py`
-  has no `--synthetic` equivalent (its whole dataset is already synthesized from
-  real loops, so it always needs a library); the fast-iteration knob there is a
-  small `--num_samples` for a quick cache plus a low `--epochs`. Don't mistake
-  a small `--num_samples` for the quality knob - see the segmentation tuning
-  table above for what actually moves val_F1.
-- `drum_humanizer_v3.py` also has a hidden `--mode grid_search` (not shown in
-  its own usage examples) for sweeping `--grid_batch_sizes` /
-  `--grid_model_sizes` / `--grid_lrs` combos.
-- `--resume <checkpoint>` on both trainers continues training from a saved
-  checkpoint instead of starting over.
-- **`--max_seq_len` is a compute knob, not just a ceiling - and an oversized one
-  is catastrophic on a small card.** EVERY sample is padded to it, and attention
-  is O(n^2). Measured on a 166k-sample library: median sample is **38 notes**,
-  p95 is 176, and only 0.10% exceed 1024 - so the old 1024 default made **93.9%
-  of every batch pure padding** (16x wasted work in the linear layers, 123x in
-  attention). Worse, at `max_seq_len=1024 --batch_size 32` the activations need
-  ~15.5GB; on a 4GB card Windows WDDM does not hard-OOM, it silently spills to
-  system RAM over PCIe, so training still "runs" - at 17 seconds per batch, with
-  `nvidia-smi` showing a misleading 100% GPU utilization (thrashing, not math).
-  Benchmarked on a GTX 1650:
+**Other useful things to know:**
+- `--synthetic` on `drum_humanizer_v3.py` lets you test that training works from start to finish, using fake data — no real MIDI library needed. This is useful to quickly check a code change before waiting for a real cache to build. `drum_theme_segmentation.py` has no `--synthetic` option (its data is already made from real MIDI loops, so it always needs a library). To test it quickly instead, use a small `--num_samples` and a low `--epochs`. Note: a small `--num_samples` is only for quick testing — it does not improve quality. See the table in Step 3 for what actually improves the score.
+- `drum_humanizer_v3.py` also has a hidden mode, `--mode grid_search` (not shown in its own help text). It tries many combinations of `--grid_batch_sizes`, `--grid_model_sizes`, and `--grid_lrs` to find the best one.
+- `--resume <checkpoint>` on both training tools continues training from a saved checkpoint file, instead of starting from zero.
+- **`--max_seq_len` controls speed, not just a limit — picking too big a number can make training extremely slow.** Every training example is padded (filled with empty space) up to this length, and the cost of attention grows with the square of this number. On a library of 166,000 samples: the middle (median) sample has only 38 notes, 95% of samples have 176 notes or fewer, and only 0.10% have more than 1024 notes. So the old default of 1024 meant 93.9% of every batch was just empty padding — 16x wasted work in normal layers, and 123x wasted work in attention. It gets worse: with `max_seq_len=1024` and `--batch_size 32`, you need about 15.5GB of GPU memory. On a 4GB card, Windows does not clearly show an "out of memory" error — it silently spills over into regular computer memory (RAM), which is much slower. Training still runs, but each batch takes 17 seconds, and `nvidia-smi` wrongly shows 100% GPU use (it's stuck waiting, not doing real work). Measured on a GTX 1650 graphics card:
 
-  | `max_seq_len` / `batch_size` | s/batch | samples/s | peak VRAM |
+  | `max_seq_len` / `batch_size` | seconds per batch | samples per second | peak GPU memory |
   |---|---|---|---|
   | 1024 / 32 (old default) | 17.11 | 2 | 15,563 MB |
   | **256 / 32 (new default)** | **1.18** | **27** | **1,557 MB** |
   | 192 / 32 | 0.88 | 36 | 1,044 MB |
   | 128 / 64 | 1.02 | 63 | 1,153 MB |
 
-  Coverage tradeoff: 256 leaves 98.5% of samples uncropped, 192 leaves 96.2%,
-  128 only 88%. Samples longer than the window are randomly cropped in training
-  and chunked with overlap-blending at inference, so a smaller value is a speed
-  win rather than a quality loss - until the crop rate gets high enough to start
-  truncating real phrases. **The value is baked into the cache**, so an existing
-  cache keeps its old one: pass `--max_seq_len 256` explicitly, or rebuild.
-- **`--model_size` (`tiny`/`small`/`base`/`deep`/`deeper`/`huge`) is a real speed
-  lever, not just a quality knob - and the payoff drops off fast past `small`.**
-  Benchmarked on a GTX 1650 at `--batch_size 8 --max_seq_len 256` (with the SDPA
-  attention fusion in place):
+  Trade-off: with 256, 98.5% of samples are used in full (not cut short). With 192, it's 96.2%. With 128, only 88%. Samples longer than the window get randomly shortened during training, and split into overlapping pieces during inference — so a smaller number is mostly a speed win, not a quality loss, as long as you don't cut too much. **This number is saved inside the cache file.** An existing cache keeps its old value. To use a new value, either pass `--max_seq_len 256` by hand, or rebuild the cache.
 
-  | size | params | ms/batch | samples/s | vs `base` | peak VRAM |
+- **`--model_size` (`tiny`/`small`/`base`/`deep`/`deeper`/`huge`) controls speed a lot — but going bigger than `small` gives smaller and smaller extra benefit.** Measured on a GTX 1650 with `--batch_size 8 --max_seq_len 256`:
+
+  | size | parameters (learned numbers) | ms per batch | samples per second | speed vs `base` | peak GPU memory |
   |---|---|---|---|---|---|
   | tiny | 0.9M | 55 | 145.2 | 4.94x faster | 98MB |
   | **small** | **2.4M** | **124** | **64.6** | **2.20x faster** | **178MB** |
-  | base (default) | 5.8M | 272 | 29.4 | 1.00x | 326MB |
-  | deep | 13.9M | 620 | 12.9 | 0.44x | 638MB |
-  | deeper | 27.1M | 1205 | 6.6 | 0.23x | 1062MB |
-  | very_deep | 37.7M | (not benchmarked on the 1650) | - | - | - |
-  | huge | 60.6M | 2678 | 3.0 | 0.10x | 1871MB |
+  | base (default) | 5.8M | 272 | 29.4 | same speed | 326MB |
+  | deep | 13.9M | 620 | 12.9 | 0.44x (slower) | 638MB |
+  | deeper | 27.1M | 1205 | 6.6 | 0.23x (slower) | 1062MB |
+  | very_deep | 37.7M | (not tested on this card) | - | - | - |
+  | huge | 60.6M | 2678 | 3.0 | 0.10x (slower) | 1871MB |
 
-  **`very_deep` is DEPTH-first, and deliberately not just "bigger".** It is the only
-  preset that goes *deeper* than `huge` (20 layers vs 18) while staying *narrower*
-  (d_model 384 vs 512), so it costs ~37.7M params instead of ~60.6M. The reasoning,
-  from this library's own measurements: ~166k section-samples hold only ~10.4M
-  supervised note-events (median 38 notes/sample), and a real sweep put `base`
-  (5.8M) at val_loss 8.2999 against `deep` (13.9M) at 8.2949 - a 0.006 gap, i.e.
-  noise. Capacity was not the binding constraint, so extra *width* (params grow
-  ~quadratically in d_model) mostly buys overfitting; extra *depth* buys more
-  rounds of relating distant hits at only ~linear param cost, which is what
-  "is this a build / is this the bar before a fill" actually needs. Dropout rises
-  to 0.25 to match. **Be honest about the odds though: the same evidence that
-  motivates the shape also predicts it may not beat `deep` at all** - it is worth
-  one sweep slot, not a default choice, and it is the most expensive combo in any
-  grid it appears in.
+  **`very_deep` is built to be deep, not just bigger.** It is the only option deeper than `huge` (20 layers vs 18 layers), while also being narrower (384 vs 512 "width"), so it has only about 37.7M parameters instead of 60.6M. Why: this library's ~166,000 training samples only have about 10.4M real note-events in total (median 38 notes per sample). A real test showed `base` (5.8M) at loss 8.2999 versus `deep` (13.9M) at 8.2949 — almost no difference (just noise). This means more parameters (width) was not the real problem — making the model *wider* mostly causes overfitting (memorizing instead of learning). Making it *deeper* instead lets it reason about things far apart in the song (like "is this the start of a build-up before a fill?") at a lower cost. Dropout is also raised to 0.25 to match. **Be honest: this same reasoning also means `very_deep` might not beat `deep` at all.** It is worth trying once in a sweep, but it is not a safe default choice, and it is the most expensive option in any sweep.
 
-  `small` is the pick used above: more than 2x faster than `base` while staying
-  the same order of magnitude in parameters (unlike `tiny`, which is a genuinely
-  smaller model at 16% of `base`'s capacity - nearly 5x faster, but a real
-  capacity cut, not just a speed one). VRAM is not the constraint at ANY of these
-  sizes on a 4GB card at this batch size - if a smaller model isn't warranted,
-  raising `--batch_size` is a separate, still-available lever. Whether `small`'s
-  humanization actually sounds as good as `base`'s is a quality question this
-  benchmark can't answer - only listening to real output can.
-- **Big cache + DataLoader workers on Windows = MemoryError before the first
-  batch.** Windows/macOS start workers by `spawn`, so every worker gets a full
-  *pickled copy* of the dataset, and the parent has to build that whole pickle
-  buffer in RAM to hand over. Train and val each spawn `--num_workers`, so the
-  real cost is about `(2*num_workers + 1)` x the cache. A 2.5GB cache with
-  `--num_workers 4` projects to ~21GB and dies inside `w.start()` with a
-  traceback pointing at `multiprocessing/reduction.py`, not at the real cause.
-  Both trainers now measure this up front and fall back to `num_workers=0`
-  (main-process loading, no pickling, no copies) with a printed explanation.
-  `__getitem__` is numpy slicing in both, so workers were buying little anyway.
-  Set `DBH_FORCE_WORKERS=1` to keep the configured count regardless. Linux
-  `fork` shares those pages copy-on-write and is never downgraded.
-- `drum_theme_segmentation.py`'s **validation windows are deterministic** (fixed,
-  evenly-spaced crops) while training windows are random. This is deliberate: a
-  `val_F1` measured on a different random slice each epoch isn't comparable
-  epoch-to-epoch, which silently corrupts both "new best" checkpoint selection
-  and early stopping (they end up reacting to sampling noise instead of to the
-  model). Don't "simplify" the val loader back to random crops.
-- `find_similar_grooves.py --mode query --exclude_same_family` filters out
-  results whose filename is just a near-duplicate/variation of the query
-  (e.g. "Fill 1" vs "Fill 14") - useful when the top match is trivially the
-  same take as the query.
-- `drum_bass_studio.py`'s audition/playback only makes real sound on
-  **Windows** (it drives the built-in Microsoft GS Wavetable Synth through
-  `mido`/`python-rtmidi`). The UI and matching logic work everywhere, but
-  actual audio needs Windows.
-- `config.py` tags each constant as a `JUDGMENT CALL` (developer intuition,
-  fine to retune by feel) vs. `VERIFIED FINDING` / `HARD TECHNICAL CONSTRAINT`
-  (derived from something real - don't casually change without re-checking
-  why it's there).
-- All training/inference entry points already auto-select the best available
-  device (`cuda` -> `mps` -> `cpu`), so nothing needs to be passed to use a
-  GPU - it just happens if `torch.cuda.is_available()` is `True`.
-- `pip install -r requirements.txt` installs a **CPU-only** `torch` by
-  default. On an NVIDIA-GPU machine, install the CUDA build instead (match
-  the CUDA version to your driver - check with `nvidia-smi`, then see
-  https://pytorch.org/get-started/locally/ for the right `--index-url`), e.g.:
+  `small` is the recommended one above: more than 2x faster than `base`, while still similar in size (unlike `tiny`, which is a real cut in ability — only 16% of `base`'s size, almost 5x faster, but a real quality trade-off, not just speed). None of these sizes come close to using all 4GB of GPU memory at this batch size — if you don't need a smaller model, you can instead just raise `--batch_size` to go faster. Whether `small`'s output actually *sounds* as good as `base`'s is something only your own ears can tell you — this test only measures speed and memory.
+
+- **A big cache plus multiple DataLoader workers on Windows can crash with "MemoryError" before training even starts.** On Windows and macOS, each worker process gets its own full copy of the dataset, and that whole copy first has to be prepared in memory by the main process. Training and validation each use `--num_workers` workers, so the real memory cost is roughly `(2 x num_workers + 1)` times the cache size. Example: a 2.5GB cache with `--num_workers 4` would need about 21GB of memory, and crashes inside `w.start()` with an error message that does not clearly explain the real cause. Both training tools now check for this ahead of time and automatically switch to `num_workers=0` instead (load data in the main process, no copies needed), printing an explanation when they do. Since loading one item is already fast (simple array slicing), extra workers weren't helping much anyway. To force a specific worker count anyway, set `DBH_FORCE_WORKERS=1`. On Linux, this problem does not happen (it uses a cheaper way to share memory between processes, called `fork`).
+- In `drum_theme_segmentation.py`, the **validation data windows are always the same** (fixed, evenly spaced), while training windows are random each time. This is on purpose: if validation also used random windows, the score (`val_F1`) would change randomly between epochs just from luck, not from the model actually getting better or worse. That would break both "save the best checkpoint" and "stop early" logic, because they would react to random noise instead of real improvement. Do not change the validation loader back to random windows.
+- `find_similar_grooves.py --mode query --exclude_same_family` removes results that are just a small variation of your search file (like "Fill 1" vs "Fill 14"). Useful when the top result is basically the same file as what you searched for.
+- `drum_bass_studio.py`'s play/preview sound only works on **Windows** (it uses the built-in Microsoft GS Wavetable Synth through `mido`/`python-rtmidi`). The window and all the matching/search logic work on any operating system — only the actual sound needs Windows.
+- In `config.py`, each setting is labeled either `JUDGMENT CALL` (a guess based on experience — safe to change if you want) or `VERIFIED FINDING` / `HARD TECHNICAL CONSTRAINT` (based on real testing or a real limit — check why it's there before changing it).
+- All training and inference commands automatically pick the best available hardware, in this order: `cuda` (NVIDIA GPU) -> `mps` (Apple GPU) -> `cpu`. You don't need to tell it to use your GPU — it happens automatically if `torch.cuda.is_available()` returns `True`.
+- `pip install -r requirements.txt` installs the **CPU-only** version of `torch` by default. If you have an NVIDIA GPU, install the CUDA version instead (match the CUDA version to your graphics driver — check with `nvidia-smi`, then see https://pytorch.org/get-started/locally/ for the exact install command). For example:
   ```bash
   pip install torch==2.13.0+cu130 --index-url https://download.pytorch.org/whl/cu130
   ```
-  Verify it took with `python -c "import torch; print(torch.cuda.is_available())"`.
-  On a 4GB-class card, drop `--batch_size` if training hits a CUDA
-  out-of-memory error.
-- The `dbh` venv is set as this workspace's default interpreter (see
-  `drum_bass_human.code-workspace`), so a fresh VS Code terminal should
-  already have it active - no need to `source dbh/bin/activate` manually
-  unless running from a plain shell outside VS Code.
+  Check that it worked: `python -c "import torch; print(torch.cuda.is_available())"` should print `True`.
+  On a 4GB-class GPU, lower `--batch_size` if training gives a CUDA "out of memory" error.
+- If you use VS Code, you can set the `dbh` virtual environment as the default interpreter in your own local `.code-workspace` file, so a new VS Code terminal already has it active. This file is personal to your machine and is not saved in git.
+
+## Example: full training commands
 
 ```bash
 dbh\Scripts\activate.bat
 
 tensorboard --logdir checkpoints
-http://localhost:6006
+# then open this in your browser: http://localhost:6006
 
 python drum_theme_segmentation.py --mode dataset --data_dir ./data --cache ./cache/segments.pkl --num_samples 15000
 python drum_theme_segmentation.py --mode train --cache ./cache/segments.pkl --run_name seg_model --epochs 100 --windows_per_sample 8
@@ -479,11 +310,9 @@ python drum_humanizer_v3.py --mode cache --data_dir "./data" --cache ./cache/sam
 python drum_humanizer_v3.py --mode train --cache cache/samples.pkl --run_name humanizer_final_v1 --model_size deep --batch_size 32 --lr 1.5e-4 --data_fraction 1.0 --epochs 100
 
 python drum_humanizer_v3.py --mode grid_search --cache cache/samples.pkl --run_name grid --grid_model_sizes base,deep --grid_batch_sizes 32,16 --grid_lrs 7.5e-5,1.5e-4 --data_fraction 0.1 --epochs 3
-
-
 ```
 
-## 7. Fresh setup on a new Ubuntu machine
+## Fresh setup on a new Ubuntu machine
 
 ```bash
 python3 -m venv dbh
@@ -496,10 +325,4 @@ python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 python drum_humanizer_v3.py --mode cache --data_dir ./data --cache cache/samples.pkl --hop_bars 16 --section_bars 16
 
 python drum_humanizer_v3.py --mode grid_search --cache cache/samples.pkl --run_name grid --grid_model_sizes huge,very_deep --grid_batch_sizes 128,64 --grid_lrs 8e-4,4e-4 --data_fraction 0.25 --epochs 20 --grid_final_epoch_multiplier 5
-
 ```
-
-
-
-
-

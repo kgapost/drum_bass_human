@@ -116,7 +116,7 @@ except ImportError:
 # where this script is launched from.
 DEFAULT_GROOVE_INDEX_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'cache', 'groove_index.pkl')
-GROOVE_SEARCH_TOP_K = 20  # candidates cached per segment, shown in the results list
+GROOVE_SEARCH_TOP_K = 30  # candidates cached per segment, shown in the results list
 SWAPPED_GROOVE_MARKER_COLOR = '#FFFFFF'   # timeline marker: this segment's source
                                           # audio was swapped for a library groove -
                                           # white (+ outline) reads clearly against
@@ -1033,14 +1033,20 @@ class StudioApp:
         # Maps directly to the model's boundary-probability threshold (see
         # SEGMENTATION_CONFIDENCE_THRESHOLD in config.py): 0.05-0.95 is the same
         # range drum_theme_segmentation.py's own sweep_threshold() scores at
-        # training time, so every value here is one the model was actually
-        # evaluated at. The scale is reversed (from_=0.95 to=0.05) so dragging
-        # right raises sensitivity (lower threshold -> more, subtler boundaries)
-        # and dragging left lowers it (higher threshold -> fewer, more confident
-        # ones) - "more sensitive" reads naturally as "further right".
+        # training time, so every value except the lowest notch is one the
+        # model was actually evaluated at. The floor goes down to 0.01 (below
+        # the sweep's own 0.05) so the extreme-right position can still pick
+        # up a boundary the model assigns only a very weak (but nonzero)
+        # probability to, for songs where the model's confidence never
+        # reaches 0.05 anywhere - full-right previously had no further effect
+        # once already at 0.05. The scale is reversed (from_=0.95 to=0.01) so
+        # dragging right raises sensitivity (lower threshold -> more, subtler
+        # boundaries) and dragging left lowers it (higher threshold -> fewer,
+        # more confident ones) - "more sensitive" reads naturally as "further
+        # right".
         top3 = ttk.Frame(self.root); top3.pack(fill='x', padx=8, pady=(0, 6))
         ttk.Label(top3, text="Segmentation sensitivity:").pack(side='left')
-        self.seg_threshold_scale = ttk.Scale(top3, from_=0.95, to=0.05, orient='horizontal',
+        self.seg_threshold_scale = ttk.Scale(top3, from_=0.95, to=0.01, orient='horizontal',
                                              variable=self.seg_threshold_var,
                                              command=self._on_seg_threshold_drag)
         self.seg_threshold_scale.pack(side='left', fill='x', expand=True, padx=(8, 4))
@@ -1053,14 +1059,15 @@ class StudioApp:
         self.seg_threshold_scale.bind('<KeyRelease>', self._on_seg_threshold_release)
 
         # -- drum drop zone --
+        # (the bass drop zone + its two audition buttons live inside the
+        # Phase 3 collapsible now, since bass sync is the only phase that
+        # needs them - see _build_phase3_controls)
         drum_label_row = ttk.Frame(self.root); drum_label_row.pack(fill='x', padx=8)
         ttk.Label(drum_label_row, text="Drum MIDI (full song):").pack(side='left')
-        both_btn = ttk.Button(drum_label_row, text="▶ Audition selected segment",
-                              command=lambda: self._toggle_audition('both'))
-        both_btn.pack(side='right')
         drum_btn = ttk.Button(drum_label_row, text="▶ Audition selected drum segment",
                               command=lambda: self._toggle_audition('drum'))
-        drum_btn.pack(side='right', padx=(0, 6))
+        drum_btn.pack(side='right')
+        self._audition_buttons = {'drum': drum_btn}
         self.drum_drop = tk.Label(self.root, text=self._drop_text("drum"), relief='groove',
                                   bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.drum_drop.pack(fill='x', padx=8, pady=(0, 4))
@@ -1075,29 +1082,11 @@ class StudioApp:
         self.seg_canvas = tk.Canvas(self.root, bg='#e8e8e8', highlightthickness=0)
         self.seg_canvas.bind('<Configure>', lambda e: self._redraw_timeline_canvas(self.seg_canvas, self.drum_drop))
 
-        # -- bass drop zone --
-        bass_label_row = ttk.Frame(self.root); bass_label_row.pack(fill='x', padx=8, pady=(6, 0))
-        ttk.Label(bass_label_row, text="Bass MIDI (matching song, same tempo/alignment):").pack(side='left')
-        bass_btn = ttk.Button(bass_label_row, text="▶ Audition selected bass segment",
-                              command=lambda: self._toggle_audition('bass'))
-        bass_btn.pack(side='right')
-        self._audition_buttons = {'drum': drum_btn, 'bass': bass_btn, 'both': both_btn}
-        self.bass_drop = tk.Label(self.root, text=self._drop_text("bass"), relief='groove',
-                                  bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
-        self.bass_drop.pack(fill='x', padx=8, pady=(0, 6))
-        self.bass_drop.bind('<Button-1>', self._on_browse_bass)
-
-        # Same overlap treatment on the bass drop zone - the segment timeline is
-        # one song structure, shown wherever there's a drop zone for it.
-        self.seg_canvas_bass = tk.Canvas(self.root, bg='#e8e8e8', highlightthickness=0)
-        self.seg_canvas_bass.bind('<Configure>', lambda e: self._redraw_timeline_canvas(self.seg_canvas_bass, self.bass_drop))
-
         if HAS_DND:
-            for widget, kind in ((self.drum_drop, 'drum'), (self.bass_drop, 'bass'),
-                                 (self.seg_canvas, 'drum'), (self.seg_canvas_bass, 'bass')):
+            for widget in (self.drum_drop, self.seg_canvas):
                 try:
                     widget.drop_target_register(DND_FILES)
-                    widget.dnd_bind('<<Drop>>', lambda e, k=kind: self._on_drop(e, k))
+                    widget.dnd_bind('<<Drop>>', lambda e: self._on_drop(e, 'drum'))
                 except Exception as exc:
                     _report_error("enabling drag-and-drop (falling back to click-to-browse)", exc)
 
@@ -1105,13 +1094,12 @@ class StudioApp:
             # its current audio to wherever it's dropped (Explorer, another
             # app, etc) - Windows-only feature, uses OLE2 drag-and-drop under
             # the hood via tkdnd. See _on_segment_drag_init.
-            for canvas, kind in ((self.seg_canvas, 'drum'), (self.seg_canvas_bass, 'bass')):
-                try:
-                    canvas.drag_source_register(1, DND_FILES)
-                    canvas.dnd_bind('<<DragInitCmd>>',
-                                    lambda e, c=canvas, k=kind: self._on_segment_drag_init(e, c, k))
-                except Exception as exc:
-                    _report_error("enabling segment drag-out", exc)
+            try:
+                self.seg_canvas.drag_source_register(1, DND_FILES)
+                self.seg_canvas.dnd_bind('<<DragInitCmd>>',
+                                lambda e: self._on_segment_drag_init(e, self.seg_canvas, 'drum'))
+            except Exception as exc:
+                _report_error("enabling segment drag-out", exc)
 
         # -- segment navigation: move between segments without needing to
         # click the exact timeline rectangle (fiddly on a song with many
@@ -1215,9 +1203,12 @@ class StudioApp:
 
     def _on_seg_threshold_release(self, event=None):
         # Snap to the 0.05 steps sweep_threshold() actually scores, so the
-        # value shown is always one the model was validated at.
-        snapped = round(self.seg_threshold_var.get() / 0.05) * 0.05
-        snapped = min(0.95, max(0.05, snapped))
+        # value shown is (almost) always one the model was validated at -
+        # except the 0.01 floor itself, one notch finer than the sweep, kept
+        # as an escape hatch for songs where even 0.05 finds nothing further.
+        raw = self.seg_threshold_var.get()
+        snapped = 0.01 if raw <= 0.03 else round(raw / 0.05) * 0.05
+        snapped = min(0.95, max(0.01, snapped))
         self.seg_threshold_var.set(snapped)
         self.seg_threshold_label.config(text=f"{snapped:.2f}")
         if self.seg_model is not None and self.drum_path:
@@ -1679,28 +1670,40 @@ class StudioApp:
                                              foreground='gray')
         self.groove_status_label.pack(anchor='w', padx=8, pady=(4, 2))
 
-        list_frame = ttk.Frame(parent); list_frame.pack(fill='x', padx=8, pady=(0, 4))
-        self.groove_tree = ttk.Treeview(list_frame, columns=('rank', 'sim', 'file'),
-                                        show='headings', selectmode='browse', height=10)
-        self.groove_tree.heading('rank', text='#')
-        self.groove_tree.column('rank', width=32, anchor='center', stretch=False)
-        self.groove_tree.heading('sim', text='Similarity')
-        self.groove_tree.column('sim', width=80, anchor='center', stretch=False)
-        self.groove_tree.heading('file', text='File')
-        self.groove_tree.column('file', width=300, anchor='w')
-        vsb = ttk.Scrollbar(list_frame, orient='vertical', command=self.groove_tree.yview)
-        self.groove_tree.configure(yscrollcommand=vsb.set)
-        self.groove_tree.pack(side='left', fill='x', expand=True)
+        # DESIGN: a plain tk.Listbox, not a ttk.Treeview. tkdnd's native
+        # Windows drag-and-drop hook is unreliable on themed (ttk) widgets -
+        # confirmed by testing: dragging out of the segment timeline (a plain
+        # tk.Canvas) reliably copies the file, dragging out of a ttk.Treeview
+        # did not. Listbox is the same "classic" Tk widget family as Canvas,
+        # so it gets the same reliable native drag behavior. Columns are
+        # faked with a monospace font + fixed-width text formatting since
+        # Listbox has no column support.
+        self.GROOVE_LIST_FONT = ('Consolas', 9)
+        header = ttk.Frame(parent); header.pack(fill='x', padx=8)
+        ttk.Label(header, text=self._format_groove_row('#', 'Similarity', 'File'),
+                 font=self.GROOVE_LIST_FONT, foreground='gray').pack(anchor='w')
+
+        # fill='both', expand=True (on both the frame and the listbox) so this
+        # list - and only this list, not the header/status/button rows around
+        # it - claims any extra vertical space when the window is resized
+        # taller, rather than leaving it as dead space below a fixed height.
+        list_frame = ttk.Frame(parent); list_frame.pack(fill='both', expand=True, padx=8, pady=(0, 4))
+        self.groove_listbox = tk.Listbox(list_frame, font=self.GROOVE_LIST_FONT,
+                                         selectmode='browse', height=10,
+                                         exportselection=False, activestyle='none')
+        vsb = ttk.Scrollbar(list_frame, orient='vertical', command=self.groove_listbox.yview)
+        self.groove_listbox.configure(yscrollcommand=vsb.set)
+        self.groove_listbox.pack(side='left', fill='both', expand=True)
         vsb.pack(side='right', fill='y')
-        self.groove_tree.bind('<<TreeviewSelect>>', self._on_groove_row_select)
-        self.groove_tree.bind('<Double-Button-1>', self._on_groove_row_double_click)
+        self.groove_listbox.bind('<<ListboxSelect>>', self._on_groove_row_select)
+        self.groove_listbox.bind('<Double-Button-1>', self._on_groove_row_double_click)
         if HAS_DND:
             # OUTBOUND: dragging a row out of the results list copies that
             # library groove file to wherever it's dropped - same mechanism
             # (and same COPY action) as dragging a segment out of the timeline.
             try:
-                self.groove_tree.drag_source_register(1, DND_FILES)
-                self.groove_tree.dnd_bind('<<DragInitCmd>>', self._on_groove_row_drag_init)
+                self.groove_listbox.drag_source_register(1, DND_FILES)
+                self.groove_listbox.dnd_bind('<<DragInitCmd>>', self._on_groove_row_drag_init)
             except Exception as exc:
                 _report_error("enabling groove-list drag-out", exc)
 
@@ -1716,58 +1719,83 @@ class StudioApp:
                                             command=self._on_revert_groove, state='disabled')
         self.groove_revert_btn.pack(side='left')
 
+    @staticmethod
+    def _format_groove_row(rank, sim, filename) -> str:
+        return f"{rank:>3}   {sim:>10}   {filename}"
+
     def _refresh_groove_section(self, seg: Optional[SegmentSettings]):
-        for iid in self.groove_tree.get_children():
-            self.groove_tree.delete(iid)
-        self.groove_selected_result = None
-        self.groove_audition_btn.config(state='disabled')
-        self.groove_use_btn.config(state='disabled')
-        if seg is None:
-            self.groove_status_label.config(text="Select a segment to see similar grooves.",
-                                            foreground='gray')
-            self.groove_revert_btn.config(state='disabled')
-            return
-        self.groove_revert_btn.config(state='normal' if seg.swapped_groove_path else 'disabled')
-        if seg.swapped_groove_path:
-            using = f"Using: {os.path.basename(seg.swapped_groove_source or seg.swapped_groove_path)}"
-        else:
-            using = "Using: original recording"
-        if seg.groove_results is None:
-            suffix = "load a groove index to search" if self.groove_index is None else "searching..."
-            self.groove_status_label.config(text=f"{using}  -  {suffix}",
-                                            foreground='gray' if self.groove_index is None else '#0066cc')
-            return
-        if seg.groove_search_error:
-            self.groove_status_label.config(text=f"{using}  -  search failed (see console).",
-                                            foreground='#b00000')
-            return
-        for i, r in enumerate(seg.groove_results, 1):
-            self.groove_tree.insert('', 'end', iid=str(i - 1),
-                                    values=(i, f"{r['similarity']:.3f}", os.path.basename(r['path'])))
-        n = len(seg.groove_results)
-        self.groove_status_label.config(
-            text=f"{using}  -  {n} similar groove{'s' if n != 1 else ''} found.", foreground='gray')
+        # unlike ttk.Treeview (where 'disabled' is purely cosmetic), a plain
+        # tk.Listbox's disabled state blocks insert/delete outright - force
+        # 'normal' while repopulating so gating (set via set_enabled, which
+        # may run before this) never leaves stale/empty rows behind, then
+        # restore whatever state it had.
+        prev_state = str(self.groove_listbox.cget('state'))
+        self.groove_listbox.config(state='normal')
+        try:
+            self.groove_listbox.delete(0, 'end')
+            self.groove_selected_result = None
+            self.groove_audition_btn.config(state='disabled')
+            self.groove_use_btn.config(state='disabled')
+            if seg is None:
+                self.groove_status_label.config(text="Select a segment to see similar grooves.",
+                                                foreground='gray')
+                self.groove_revert_btn.config(state='disabled')
+                return
+            self.groove_revert_btn.config(state='normal' if seg.swapped_groove_path else 'disabled')
+            if seg.swapped_groove_path:
+                using = f"Using: {os.path.basename(seg.swapped_groove_source or seg.swapped_groove_path)}"
+            else:
+                using = "Using: original recording"
+            if seg.groove_results is None:
+                suffix = "load a groove index to search" if self.groove_index is None else "searching..."
+                self.groove_status_label.config(text=f"{using}  -  {suffix}",
+                                                foreground='gray' if self.groove_index is None else '#0066cc')
+                return
+            if seg.groove_search_error:
+                self.groove_status_label.config(text=f"{using}  -  search failed (see console).",
+                                                foreground='#b00000')
+                return
+            for i, r in enumerate(seg.groove_results, 1):
+                self.groove_listbox.insert(
+                    'end', self._format_groove_row(i, f"{r['similarity']:.3f}", os.path.basename(r['path'])))
+            n = len(seg.groove_results)
+            self.groove_status_label.config(
+                text=f"{using}  -  {n} similar groove{'s' if n != 1 else ''} found.", foreground='gray')
+        finally:
+            self.groove_listbox.config(state=prev_state)
 
     def _on_groove_row_select(self, event=None):
-        sel = self.groove_tree.selection()
+        sel = self.groove_listbox.curselection()
         seg = self._current_segment()
         if not sel or seg is None or not seg.groove_results:
             self.groove_selected_result = None
             self.groove_audition_btn.config(state='disabled')
             self.groove_use_btn.config(state='disabled')
             return
-        self.groove_selected_result = seg.groove_results[int(sel[0])]
+        self.groove_selected_result = seg.groove_results[sel[0]]
         self.groove_audition_btn.config(state='normal')
         self.groove_use_btn.config(state='normal')
+
+    def _groove_row_at_y(self, y) -> Optional[int]:
+        """Listbox.nearest() always returns a valid index even below the last
+        row or in an empty list, so guard against those cases explicitly."""
+        if self.groove_listbox.size() == 0:
+            return None
+        idx = self.groove_listbox.nearest(y)
+        bbox = self.groove_listbox.bbox(idx)
+        if not bbox or y < bbox[1] or y > bbox[1] + bbox[3]:
+            return None
+        return idx
 
     def _on_groove_row_double_click(self, event):
         """Double-click a row to play it; double-click again (or the row
         currently playing) to stop - same toggle _on_groove_audition already
         implements for the Audition button, just reachable straight from the
         list too."""
-        row_iid = self.groove_tree.identify_row(event.y)
-        if row_iid:
-            self.groove_tree.selection_set(row_iid)
+        idx = self._groove_row_at_y(event.y)
+        if idx is not None:
+            self.groove_listbox.selection_clear(0, 'end')
+            self.groove_listbox.selection_set(idx)
             self._on_groove_row_select()
         self._on_groove_audition()
 
@@ -1778,13 +1806,13 @@ class StudioApp:
         seg = self._current_segment()
         if seg is None or not seg.groove_results:
             return None
-        local_y = event.y_root - self.groove_tree.winfo_rooty()
-        row_iid = self.groove_tree.identify_row(local_y)
-        if not row_iid:
+        local_y = event.y_root - self.groove_listbox.winfo_rooty()
+        idx = self._groove_row_at_y(local_y)
+        if idx is None:
             return None
         try:
-            result = seg.groove_results[int(row_iid)]
-        except (ValueError, IndexError):
+            result = seg.groove_results[idx]
+        except IndexError:
             return None
         path = result['path']
         if not path or not os.path.exists(path):
@@ -2094,6 +2122,46 @@ class StudioApp:
 
     # ============================================================ PHASE 3 ==
     def _build_phase3_controls(self, parent):
+        # -- bass drop zone -- (moved here from the top-level layout: bass
+        # sync is the only phase that needs the bass file/audition buttons)
+        bass_label_row = ttk.Frame(parent); bass_label_row.pack(fill='x', padx=8, pady=(6, 0))
+        ttk.Label(bass_label_row, text="Bass MIDI (matching song, same tempo/alignment):").pack(side='left')
+        both_btn = ttk.Button(bass_label_row, text="▶ Audition selected segment",
+                              command=lambda: self._toggle_audition('both'))
+        both_btn.pack(side='right')
+        bass_btn = ttk.Button(bass_label_row, text="▶ Audition selected bass segment",
+                              command=lambda: self._toggle_audition('bass'))
+        bass_btn.pack(side='right', padx=(0, 6))
+        self._audition_buttons['bass'] = bass_btn
+        self._audition_buttons['both'] = both_btn
+        self.bass_drop = tk.Label(parent, text=self._drop_text("bass"), relief='groove',
+                                  bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
+        self.bass_drop.pack(fill='x', padx=8, pady=(0, 6))
+        self.bass_drop.bind('<Button-1>', self._on_browse_bass)
+
+        # Same overlap treatment as the drum drop zone (see _build_widgets) -
+        # the segment timeline is one song structure, shown wherever there's
+        # a drop zone for it.
+        self.seg_canvas_bass = tk.Canvas(parent, bg='#e8e8e8', highlightthickness=0)
+        self.seg_canvas_bass.bind('<Configure>',
+                                  lambda e: self._redraw_timeline_canvas(self.seg_canvas_bass, self.bass_drop))
+
+        if HAS_DND:
+            for widget in (self.bass_drop, self.seg_canvas_bass):
+                try:
+                    widget.drop_target_register(DND_FILES)
+                    widget.dnd_bind('<<Drop>>', lambda e: self._on_drop(e, 'bass'))
+                except Exception as exc:
+                    _report_error("enabling drag-and-drop (falling back to click-to-browse)", exc)
+            try:
+                self.seg_canvas_bass.drag_source_register(1, DND_FILES)
+                self.seg_canvas_bass.dnd_bind('<<DragInitCmd>>',
+                                lambda e: self._on_segment_drag_init(e, self.seg_canvas_bass, 'bass'))
+            except Exception as exc:
+                _report_error("enabling segment drag-out", exc)
+
+        ttk.Separator(parent).pack(fill='x', padx=8, pady=(2, 6))
+
         self.var_snap_strength = tk.DoubleVar(value=PHASE3_DEFAULT_SNAP_STRENGTH)
         self.var_delay_amount = tk.DoubleVar(value=PHASE3_DEFAULT_DELAY_AMOUNT)
         self._make_slider_row(parent, "Snap to kick/snare", self.var_snap_strength, *PHASE3_SNAP_STRENGTH_RANGE)
