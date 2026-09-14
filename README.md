@@ -12,12 +12,12 @@ grooves in a library, and auto-detecting theme/section boundaries in a song.
 - **drum_theme_segmentation.py** - detects section boundaries are (modes `dataset`, `train`, `infer`).
 - **find_similar_grooves.py** - given a query MIDI, ranks your library by how
   similar it feels (rhythm/velocity/density/tempo). (modes: `index`, `query`).
-- **groove_finder_ui.py** - Tkinter desktop UI wrapper around
-  `find_similar_grooves.py`.
-  (Windows only - uses the built-in GS Wavetable synth for playback.)
 - **drum_bass_studio.py** - main all-in-one app. Combines the humanizer +
-  segmentation model + bass sync into one window
-  segment, humanize each segment, tweak rush/drag, sync bass, render.
+  segmentation model + bass sync + per-segment groove search (via
+  `find_similar_grooves.py`) into one window. Segment, humanize each segment,
+  tweak rush/drag, sync bass, optionally swap in a similar library groove,
+  render. Auditions play through Windows' built-in GS Wavetable synth (see
+  `MidiPlayer` in the file - Windows only).
 - **parse_midi_library.py** - standalone housekeeping tool for a large *external*
   MIDI sample library (not part of the humanizer pipeline itself -
   tidies up a folder of purchased/downloaded MIDI packs). Prunes unwanted
@@ -41,7 +41,7 @@ pip install -r requirements.txt
 
 
 
-Note: `tkinter` (needed by `groove_finder_ui.py` and `drum_bass_studio.py`) is
+Note: `tkinter` (needed by `drum_bass_studio.py`) is
 not in requirements.txt - it's not pip-installable, comes from the system.
 On Linux, if `import tkinter` fails: `sudo apt install python3-tk`.
 On Windows, the official python.org installer (and `winget install
@@ -184,20 +184,18 @@ python find_similar_grooves.py --mode query --cache cache/groove_index.pkl \
        --query "/path/to/some_groove.mid" --top_k 15
 ```
 
-## 5. Running the UIs
+## 5. Running the UI
 
 ```bash
-# Groove Finder (needs a cache from find_similar_grooves.py --mode index first)
-python groove_finder_ui.py
-
 # Drum + Bass Humanization Studio (needs trained checkpoints from
-# drum_humanizer_v3.py and drum_theme_segmentation.py)
+# drum_humanizer_v3.py and drum_theme_segmentation.py; groove search needs a
+# cache from find_similar_grooves.py --mode index)
 python drum_bass_studio.py
 ```
 
-Both just open a window - drag/drop or Browse for the MIDI file(s), no other
-args needed. Studio's humanizer model doesn't need a manual "Load..." either -
-it auto-fetches and auto-selects the bundled pretrained model on first launch
+Just opens a window - drag/drop or Browse for the MIDI file(s), no other args
+needed. Studio's humanizer model doesn't need a manual "Load..." either - it
+auto-fetches and auto-selects the bundled pretrained model on first launch
 (see "Pretrained model" under section 3 above).
 
 ## 6. parse_midi_library.py - external MIDI library housekeeping
@@ -313,8 +311,9 @@ output before adding `--execute`.
    if I want fresh/better humanization.
 4. Build the segmentation dataset + train it (`drum_theme_segmentation.py`
    dataset -> train) if I want fresh/better auto-segmentation.
-5. Open `drum_bass_studio.py` for the actual humanize-a-song workflow, or
-   `groove_finder_ui.py` just to find similar grooves.
+5. Open `drum_bass_studio.py` for the actual humanize-a-song workflow (its
+   per-segment groove search covers finding similar grooves too), or use
+   `find_similar_grooves.py --mode query` from the CLI for a one-off lookup.
 
 ## Notes (things that aren't obvious from the commands alone)
 
@@ -324,16 +323,12 @@ output before adding `--execute`.
 |---|---|---|
 | `drum_humanizer_v3.py --mode cache` | `cache/samples.pkl` (raw training data) | only `drum_humanizer_v3.py --mode train` |
 | `drum_humanizer_v3.py --mode train` | `checkpoints/<run_name>/best.pt` | `drum_humanizer_v3.py --mode infer` **and** `drum_bass_studio.py` |
-| `find_similar_grooves.py --mode index` (or Groove Finder's "Build Index" button) | `cache/groove_index.pkl` | `find_similar_grooves.py --mode query` **and** `groove_finder_ui.py` |
+| `find_similar_grooves.py --mode index` | `cache/groove_index.pkl` | `find_similar_grooves.py --mode query` **and** `drum_bass_studio.py`'s groove search |
 
 - `drum_bass_studio.py` never builds or touches a cache. It only needs a
   trained **checkpoint** (`.pt`) from `drum_humanizer_v3.py` and one from
   `drum_theme_segmentation.py`, picked via its "browse for checkpoint" buttons.
   If I haven't trained yet, Studio has nothing to load.
-- `groove_finder_ui.py`'s "Build Index" button calls the exact same
-  `build_index()` function as `find_similar_grooves.py --mode index` - it's
-  literally the same `.pkl` format, just built through the GUI instead of the
-  CLI. Either one can build it, either one can load it.
 - At `infer` time, `drum_humanizer_v3.py` reads the model architecture
   straight out of the checkpoint file - no need to pass `--model_size` etc.
   again when humanizing.
@@ -445,10 +440,10 @@ output before adding `--execute`.
   results whose filename is just a near-duplicate/variation of the query
   (e.g. "Fill 1" vs "Fill 14") - useful when the top match is trivially the
   same take as the query.
-- `groove_finder_ui.py`'s audition/playback only makes real sound on
+- `drum_bass_studio.py`'s audition/playback only makes real sound on
   **Windows** (it drives the built-in Microsoft GS Wavetable Synth through
-  `mido`/`python-rtmidi`). It was built/tested in a headless Linux sandbox, so
-  the UI and matching logic work everywhere, but actual audio needs Windows.
+  `mido`/`python-rtmidi`). The UI and matching logic work everywhere, but
+  actual audio needs Windows.
 - `config.py` tags each constant as a `JUDGMENT CALL` (developer intuition,
   fine to retune by feel) vs. `VERIFIED FINDING` / `HARD TECHNICAL CONSTRAINT`
   (derived from something real - don't casually change without re-checking

@@ -17,6 +17,7 @@ tokens that a plain requests.get() on the file URL would choke on.
 import os
 import sys
 import argparse
+from typing import List
 
 try:
     import gdown
@@ -27,22 +28,30 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import drum_humanizer_v3 as dh
 import drum_theme_segmentation as dts
+from config import (
+    PRETRAINED_DRIVE_FOLDER_ID, PRETRAINED_HUMANIZER_CKPT_NAME, PRETRAINED_HUMANIZER_META_NAME,
+    PRETRAINED_SEGMENTATION_CKPT_NAME, PRETRAINED_SEGMENTATION_META_NAME,
+)
 
-# DESIGN: this is the shared Drive FOLDER's id, not a specific file id. Matching by
-# filename inside the folder - rather than hardcoding a file id - means re-uploading
-# a replacement model in Drive is picked up automatically with no code change here.
-# Both models live side by side in this one folder.
-PRETRAINED_DRIVE_FOLDER_ID = '1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye'
 PRETRAINED_DRIVE_FOLDER_URL = f'https://drive.google.com/drive/folders/{PRETRAINED_DRIVE_FOLDER_ID}'
 
 _MODELS = [
-    {'label': 'humanizer', 'ckpt_name': 'humanizer_best.pt', 'meta_name': 'humanizer_metadata.json',
+    {'label': 'humanizer', 'ckpt_name': PRETRAINED_HUMANIZER_CKPT_NAME,
+     'meta_name': PRETRAINED_HUMANIZER_META_NAME,
      'ckpt_path': dh.DEFAULT_PRETRAINED_CHECKPOINT, 'meta_path': dh.DEFAULT_PRETRAINED_METADATA,
      'pretrained_dir': dh.PRETRAINED_DIR},
-    {'label': 'segmentation', 'ckpt_name': 'segmentation_best.pt', 'meta_name': 'segmentation_metadata.json',
+    {'label': 'segmentation', 'ckpt_name': PRETRAINED_SEGMENTATION_CKPT_NAME,
+     'meta_name': PRETRAINED_SEGMENTATION_META_NAME,
      'ckpt_path': dts.DEFAULT_PRETRAINED_CHECKPOINT, 'meta_path': dts.DEFAULT_PRETRAINED_METADATA,
      'pretrained_dir': dts.PRETRAINED_DIR},
 ]
+
+
+def pretrained_models_missing() -> List[str]:
+    """Labels (e.g. ['humanizer', 'segmentation']) of pretrained models not
+    currently present locally. Pure local filesystem check - no network call -
+    so callers can cheaply decide whether to prompt before fetching anything."""
+    return [m['label'] for m in _MODELS if not os.path.exists(m['ckpt_path'])]
 
 
 def ensure_pretrained_model(force: bool = False, quiet: bool = False) -> bool:

@@ -31,9 +31,10 @@ REUSED FROM THE OTHER PROJECT SCRIPTS (see their own docstrings for detail)
                                  the MIDI grid/Config, load/write helpers.
   drum_theme_segmentation.py  - the segmentation model (compute_segment_
                                  boundaries, bar_to_seconds).
-  groove_finder_ui.py         - MidiPlayer (in-process MIDI playback engine),
-                                 tempo helpers, error-reporting, and the
-                                 persisted-settings pattern.
+  find_similar_grooves.py     - groove-library index + fingerprint/similarity,
+                                 used for the per-segment groove search.
+The MIDI playback engine (MidiPlayer) below is shared with what used to be a
+separate groove_finder_ui.py standalone app, now folded into this file.
 Phase 2 and Phase 3's actual signal processing, and the whole window, are new.
 
 HOW IT IS USED
@@ -72,7 +73,13 @@ except ImportError:
     HAS_PRETTY_MIDI = False
 
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    import mido
+    HAS_MIDO = True
+except ImportError:
+    HAS_MIDO = False
+
+try:
+    from tkinterdnd2 import DND_FILES, COPY, TkinterDnD
     HAS_DND = True
 except ImportError:
     HAS_DND = False
@@ -86,7 +93,7 @@ except ImportError:
     HAS_HUMANIZER = False
 
 try:
-    from download_pretrained import ensure_pretrained_model
+    from download_pretrained import ensure_pretrained_model, pretrained_models_missing
     HAS_PRETRAINED_DOWNLOADER = True
 except ImportError:
     HAS_PRETRAINED_DOWNLOADER = False
@@ -98,10 +105,22 @@ except ImportError:
     HAS_SEGMENTATION = False
 
 try:
-    import groove_finder_ui as gfx    # MidiPlayer, tempo helpers, error/settings helpers
-    HAS_GFX = True
+    import find_similar_grooves as fsg   # groove-library index + fingerprint/similarity
+    HAS_GROOVE_FINDER = True
 except ImportError:
-    HAS_GFX = False
+    HAS_GROOVE_FINDER = False
+
+# DESIGN: resolved against THIS FILE's directory, not the current working
+# directory - same reasoning as the pretrained-model paths - so the bundled
+# index is found regardless of where this script is launched from.
+DEFAULT_GROOVE_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         'cache', 'groove_index.pkl')
+GROOVE_SEARCH_TOP_K = 20  # candidates cached per segment, shown in the results list
+SWAPPED_GROOVE_MARKER_COLOR = '#FFFFFF'   # timeline marker: this segment's source
+                                          # audio was swapped for a library groove -
+                                          # white (+ outline) reads clearly against
+                                          # every SEGMENT_COLORS entry, unlike a
+                                          # picked hue that could clash with one
 
 
 # =============================================================================
@@ -141,6 +160,176 @@ seed_everything(GLOBAL_SEED)
 
 
 # =============================================================================
+# MIDI PLAYBACK ENGINE  (formerly groove_finder_ui.py's MidiPlayer/_tempo_at_time)
+# =============================================================================
+# DESIGN: the output port is an INJECTED dependency (anything with a .send(msg)
+# method works) specifically so this class can be unit-tested with a mock
+# recorder instead of real MIDI hardware. On a real Windows machine,
+# `mido.open_output()` with no argument name opens the system default port,
+# which is the built-in GS Wavetable Synth.
+
+def _tempo_at_time(pm, t: float) -> float:
+    """Return the tempo (bpm) actually in effect at absolute time t, tempo-change
+    aware - the LAST tempo change at or before t, not blindly the file's first."""
+    try:
+        times, tempi = pm.get_tempo_changes()
+    except Exception:
+        return 120.0
+    if len(tempi) == 0:
+        return 120.0
+    idx = 0
+    for i, ct in enumerate(times):
+        if ct <= t:
+            idx = i
+        else:
+            break
+    return float(tempi[idx])
+
+
+class MidiPlayer:
+    """Plays one MIDI file at a time on a background thread. Forces all note
+    events onto MIDI channel 10 (GM drum channel) so playback always uses the
+    synth's drum kit sounds regardless of the source file's original channel -
+    SD3-exported grooves are drums-only files, so this is always correct here."""
+
+    DRUM_CHANNEL = 9   # 0-indexed == "channel 10" in 1-indexed MIDI terminology
+
+    def __init__(self, outport_factory: Optional[Callable[[], object]] = None):
+        # outport_factory: zero-arg callable returning an object with .send(msg).
+        # Defaults to mido's real default output (the Windows built-in synth).
+        self._outport_factory = outport_factory or self._default_outport_factory
+        self._outport = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self.is_playing = False
+
+    @staticmethod
+    def _default_outport_factory():
+        if not HAS_MIDO:
+            raise RuntimeError("mido is not installed - run: pip install mido python-rtmidi")
+        try:
+            names = mido.get_output_names()
+        except Exception as exc:
+            raise RuntimeError(f"could not list MIDI output ports ({exc}). Is "
+                               f"python-rtmidi installed? (pip install python-rtmidi)")
+        if not names:
+            raise RuntimeError("no MIDI output ports found on this system - "
+                               "Windows should always have 'Microsoft GS Wavetable "
+                               "Synth'; check Windows Sound settings / MIDI devices.")
+        # DESIGN: prefer the built-in Windows synth by name if it's present, rather
+        # than trusting whichever port happens to enumerate first - a machine with
+        # other MIDI hardware/software installed could otherwise route audition
+        # to something unexpected (or silent).
+        preferred = next((n for n in names if 'gs wavetable' in n.lower()), None)
+        return mido.open_output(preferred or names[0])
+
+    def _ensure_port(self):
+        if self._outport is None:
+            self._outport = self._outport_factory()
+        return self._outport
+
+    def play(self, path: str, on_finished: Optional[Callable[[Optional[str]], None]] = None,
+             tempo_scale: float = 1.0, force_drum_channel: bool = True):
+        """Start playback in the background. on_finished(error_message_or_None)
+        is called (from the playback thread) when playback ends, whether by
+        completing naturally, being stopped, or erroring.
+        tempo_scale: uniformly speeds up (>1) or slows down (<1) the WHOLE
+        performance's timing - e.g. 1.5 plays 50% faster. Used to retime a
+        library groove to the query's tempo when auditioning it; leave at 1.0
+        (default) to play a file at its own native tempo, unchanged.
+        force_drum_channel: this class's ORIGINAL purpose (see class docstring)
+        was auditioning drums-ONLY grooves, so every note is forced onto the
+        drum channel unconditionally by default. Pass False for a file that
+        carries its own correct per-instrument channel/program (e.g. a bass
+        part, or a mixed drum+bass file already using is_drum correctly) -
+        forcing it to the drum channel would make it play with a drum kit
+        sound regardless of its actual instrument."""
+        if self.is_playing:
+            self.stop()
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+        if tempo_scale is None or tempo_scale <= 0:
+            tempo_scale = 1.0   # defensive: a bad ratio must never divide-by-zero or reverse time
+        self._stop_event.clear()
+        self.is_playing = True
+        self._thread = threading.Thread(target=self._play_worker,
+                                        args=(path, on_finished, tempo_scale, force_drum_channel),
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _play_worker(self, path: str, on_finished, tempo_scale: float = 1.0,
+                     force_drum_channel: bool = True):
+        error = None
+        try:
+            port = self._ensure_port()
+            midi = mido.MidiFile(path)
+            # DESIGN: mido.MidiFile.play() sleeps INSIDE its generator between
+            # messages, so the stop flag would only be checked once per message -
+            # a groove with a longer gap between hits could make Stop take as long
+            # as that gap to respond. We track absolute time ourselves and sleep in
+            # SMALL (15ms) increments, checking the stop flag between every
+            # increment, so Stop (and switching tracks) is always responsive
+            # quickly regardless of how sparse the groove is.
+            tempo = 500000   # microseconds per beat, MIDI default (120 bpm)
+            start = time.monotonic()
+            elapsed_ticks = 0
+            for msg in mido.merge_tracks(midi.tracks):
+                elapsed_ticks += msg.time   # delta in ticks
+                # DESIGN: tempo_scale rescales the WHOLE performance's timing axis
+                # uniformly (not the file's own embedded tempo value itself) - this
+                # preserves the groove's internal feel/swing exactly, just played
+                # faster or slower to land on a different target tempo.
+                target_time = mido.tick2second(elapsed_ticks, midi.ticks_per_beat, tempo) / tempo_scale
+                while True:
+                    remaining = target_time - (time.monotonic() - start)
+                    if remaining <= 0:
+                        break
+                    if self._stop_event.wait(timeout=min(0.015, remaining)):
+                        break
+                if self._stop_event.is_set():
+                    break
+                if msg.is_meta:
+                    if msg.type == 'set_tempo':
+                        tempo = msg.tempo
+                    continue
+                if force_drum_channel and hasattr(msg, 'channel'):
+                    msg = msg.copy(channel=self.DRUM_CHANNEL)
+                port.send(msg)
+        except Exception as exc:
+            error = _report_error(f"playing '{os.path.basename(path)}'", exc)
+        finally:
+            self._all_notes_off()
+            self.is_playing = False
+            if on_finished is not None:
+                on_finished(error)
+
+    def _all_notes_off(self):
+        """Safety net: always silence every channel when playback ends, so a
+        Stop mid-note (or an error mid-playback) never leaves a note hanging."""
+        if self._outport is None:
+            return
+        try:
+            for ch in range(16):
+                self._outport.send(mido.Message('control_change', control=123, value=0, channel=ch))
+        except Exception:
+            pass   # best-effort cleanup; nothing more useful to do if this fails
+
+    def close(self):
+        self.stop()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if self._outport is not None:
+            try:
+                self._outport.close()
+            except Exception:
+                pass
+            self._outport = None
+
+
+# =============================================================================
 # SHARED MIDI HELPERS
 # =============================================================================
 
@@ -168,8 +357,7 @@ def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
     """
     Write a NEW small MIDI file containing only the notes inside
     [start_sec, end_sec) of source_path, times shifted to start at 0.
-    DESIGN: same approach as groove_finder_ui.py's _slice_segment_to_temp,
-    generalized to work for either the drum file (drums_only=True, since a
+    DESIGN: generalized to work for either the drum file (drums_only=True, since a
     stray non-drum track should never leak in) or the bass file (drums_only=
     False - a bass track is not marked is_drum in a MIDI file).
 
@@ -183,7 +371,7 @@ def slice_midi_to_temp(source_path: str, start_sec: float, end_sec: float,
     if not HAS_PRETTY_MIDI:
         raise RuntimeError("pretty_midi is required to slice segments.")
     src = pretty_midi.PrettyMIDI(source_path)
-    tempo = gfx._tempo_at_time(src, start_sec) if HAS_GFX else 120.0
+    tempo = _tempo_at_time(src, start_sec)
     out = pretty_midi.PrettyMIDI(initial_tempo=tempo)
     inst = _sliced_instrument(source_path, start_sec, end_sec, drums_only, program)
     out.instruments.append(inst)
@@ -197,15 +385,15 @@ def audition_both_to_temp(drum_path: str, bass_path: Optional[str], start_sec: f
     """
     Same idea as slice_midi_to_temp, but writes the drum AND bass slices into ONE
     file as two instrument tracks sharing a single MIDI clock, instead of two
-    separate files. DESIGN: groove_finder_ui.MidiPlayer plays one file at a time,
-    so this is what makes "play both simultaneously" both possible AND perfectly
-    synced - two independently-started playbacks would drift/race, one merged
-    file has no sync problem to begin with. bass_path is optional (drum-only
-    segment if no bass file is loaded yet).
+    separate files. DESIGN: MidiPlayer plays one file at a time, so this is
+    what makes "play both simultaneously" both possible AND perfectly synced -
+    two independently-started playbacks would drift/race, one merged file has
+    no sync problem to begin with. bass_path is optional (drum-only segment if
+    no bass file is loaded yet).
     """
     if not HAS_PRETTY_MIDI:
         raise RuntimeError("pretty_midi is required to slice segments.")
-    tempo = gfx._tempo_at_time(pretty_midi.PrettyMIDI(drum_path), start_sec) if HAS_GFX else 120.0
+    tempo = _tempo_at_time(pretty_midi.PrettyMIDI(drum_path), start_sec)
     out = pretty_midi.PrettyMIDI(initial_tempo=tempo)
     out.instruments.append(_sliced_instrument(drum_path, start_sec, end_sec, True, 0))
     if bass_path:
@@ -245,11 +433,76 @@ def force_all_drums_to_temp(source_path: str, temp_dir: str) -> str:
     return out_path
 
 
+def fit_groove_to_segment(groove_path: str, target_bars: int, target_tempo: float,
+                          temp_dir: str) -> str:
+    """
+    The inverse of slicing: takes a library groove (its own tempo, its own
+    length) and fits it into a segment's slot - retimed to the segment's
+    tempo, then looped end-to-end to fill the segment's bar length and
+    trimmed to exactly that length (the standard "tap a loop into a section"
+    behavior, same idea as Superior Drummer 3's Tap2Find).
+
+    DESIGN: assumes a fixed 4/4 bar, same simplifying assumption
+    drum_theme_segmentation.py itself makes (segments are only ever detected
+    on 4/4 bar boundaries in the first place, so this is consistent, not a
+    new limitation). The loop unit is snapped to the nearest whole bar at the
+    RETIMED tempo, so the seam lands on a downbeat rather than mid-bar.
+    """
+    if not HAS_PRETTY_MIDI:
+        raise RuntimeError("pretty_midi is required to use a groove.")
+    if not HAS_GROOVE_FINDER:
+        raise RuntimeError("find_similar_grooves.py is required to use a groove.")
+    src = pretty_midi.PrettyMIDI(groove_path)
+    notes, _source = fsg._select_drum_notes(src)
+    if not notes:
+        raise ValueError(f"'{os.path.basename(groove_path)}' has no drum notes to use.")
+    native_tempo = _tempo_at_time(src, 0.0)
+    scale = (native_tempo / target_tempo) if target_tempo > 0 else 1.0
+    bar_dur = 240.0 / target_tempo if target_tempo > 0 else 2.0   # seconds/bar, 4/4, at target tempo
+
+    retimed = sorted((n.start * scale, n.end * scale, n.pitch, n.velocity) for n in notes)
+    retimed_end = max(e for _, e, _, _ in retimed)
+    loop_bars = max(1, round(retimed_end / bar_dur)) if bar_dur > 0 else 1
+    loop_dur = loop_bars * bar_dur
+    target_dur = max(bar_dur, target_bars * bar_dur)
+
+    out = pretty_midi.PrettyMIDI(initial_tempo=target_tempo)
+    inst = pretty_midi.Instrument(program=0, is_drum=True, name="Swapped groove")
+    n_repeats = max(1, int(np.ceil(target_dur / loop_dur)))
+    for rep in range(n_repeats):
+        offset = rep * loop_dur
+        if offset >= target_dur:
+            break
+        for s, e, pitch, vel in retimed:
+            ns = s + offset
+            if ns >= target_dur:
+                continue
+            inst.notes.append(pretty_midi.Note(velocity=vel, pitch=pitch,
+                                               start=ns, end=min(e + offset, target_dur)))
+    inst.notes.sort(key=lambda n: n.start)
+    out.instruments.append(inst)
+    out_path = os.path.join(temp_dir, f"swap_{uuid.uuid4().hex[:8]}.mid")
+    out.write(out_path)
+    return out_path
+
+
+def _error_location(exc: BaseException) -> str:
+    tb = exc.__traceback__
+    last = None
+    while tb is not None:
+        last = tb
+        tb = tb.tb_next
+    if last is None:
+        return "unknown location"
+    f = last.tb_frame
+    return f"{os.path.basename(f.f_code.co_filename)}:{last.tb_lineno} in {f.f_code.co_name}()"
+
+
 def _report_error(context: str, exc: BaseException) -> str:
-    if HAS_GFX:
-        return gfx._report_error(context, exc)
-    print(f"[ERROR] {context}\n  {type(exc).__name__}: {exc}")
-    return f"{context}: {exc}"
+    loc = _error_location(exc)
+    msg = f"{context}\n-> {type(exc).__name__} at {loc}: {exc}"
+    print(f"[ERROR] {msg}")
+    return msg
 
 
 # =============================================================================
@@ -491,6 +744,14 @@ class SegmentSettings:
     phase3_output_path: Optional[str] = None   # processed BASS MIDI for this segment
     bass_input_path: Optional[str] = None      # this segment's sliced RAW bass
 
+    # ── Groove swap: replacing this segment's original drum recording with a
+    # similar groove found in the library (see fit_groove_to_segment). None =
+    # using the original recording, unchanged. ─────────────────────────────
+    swapped_groove_path: Optional[str] = None    # fitted (retimed/looped/trimmed) file
+    swapped_groove_source: Optional[str] = None  # the library file it came from, for display
+    groove_results: Optional[List[Dict]] = None  # cached similar-groove search results
+    groove_search_error: Optional[str] = None
+
     def is_customized(self) -> bool:
         return (self.phase1_settings != default_phase1_settings()
                 or self.phase2_settings != default_phase2_settings()
@@ -504,6 +765,8 @@ class SegmentSettings:
         self.phase1_stale = self.phase2_stale = self.phase3_stale = False
         self.phase1_raw_path = None
         self.phase1_output_path = self.phase2_output_path = self.phase3_output_path = None
+        self.swapped_groove_path = None
+        self.swapped_groove_source = None
 
 
 # =============================================================================
@@ -590,20 +853,37 @@ class StudioApp:
         self.hum_checkpoint_path: Optional[str] = None
         self.seg_threshold_var = tk.DoubleVar(value=SEGMENTATION_CONFIDENCE_THRESHOLD)
 
+        self.groove_index = None
+        self.groove_index_path: Optional[str] = None
+        self.groove_selected_result: Optional[Dict] = None   # currently highlighted row
+                                                              # in the Find Similar Groove list
+
         self.temp_dir = tempfile.mkdtemp(prefix='drum_bass_studio_')
-        self.player = gfx.MidiPlayer() if HAS_GFX else None
+        self.player = MidiPlayer()
         self.playing_path: Optional[str] = None
+        self.playing_kind: Optional[str] = None   # 'drum'/'bass'/'both' if one of the
+                                                   # three segment-audition buttons is
+                                                   # currently playing, else None
 
         self._build_widgets()
         # DESIGN: pretrained/ is gitignored (see README), so a fresh clone/machine has
-        # no models at all yet - try fetching both from the shared Drive folder first,
-        # in one call. This runs before mainloop() starts, so it's a one-time blocking
-        # delay only when a model is genuinely missing; every later launch finds them
-        # locally and skips the network check entirely.
+        # no models at all yet. Rather than silently reaching out to Google Drive on
+        # every launch, ask ONCE (a local, no-network filesystem check decides whether
+        # to even ask) and only fetch what's missing if the user agrees. This runs
+        # before mainloop() starts, so it's a one-time blocking delay only when a
+        # model is genuinely missing AND the user opts in; every later launch finds
+        # them locally and skips both the prompt and the network check entirely.
         if HAS_PRETRAINED_DOWNLOADER:
-            ensure_pretrained_model()
+            missing = pretrained_models_missing()
+            if missing and messagebox.askyesno(
+                    "Download pretrained models?",
+                    "The following pretrained model(s) were not found in pretrained/:\n\n  "
+                    + "\n  ".join(missing) +
+                    "\n\nDownload them now from the shared Google Drive folder?"):
+                ensure_pretrained_model()
         self._load_default_pretrained()
         self._load_default_seg_model()
+        self._load_default_groove_index()
         self._refresh_gating()
 
     def _set_model_status(self, dot, state):
@@ -647,6 +927,57 @@ class StudioApp:
         threading.Thread(target=self._load_seg_model_worker, args=(path,),
                          kwargs={'show_error': False, 'is_default': True}, daemon=True).start()
 
+    def _load_default_groove_index(self):
+        """Auto-load the bundled cache/groove_index.pkl, if present, so the
+        Find Similar Groove panel works without a manual 'Load...' click -
+        same pattern as the segmentation model default above."""
+        if not HAS_GROOVE_FINDER:
+            return
+        path = DEFAULT_GROOVE_INDEX_PATH
+        if not os.path.exists(path):
+            return
+        threading.Thread(target=self._load_groove_index_worker, args=(path,),
+                         kwargs={'is_default': True}, daemon=True).start()
+
+    def _on_load_groove_index(self):
+        path = filedialog.askopenfilename(title="Select groove index cache",
+                                          filetypes=[("Index cache", "*.pkl"), ("All files", "*.*")])
+        if not path:
+            return
+        if not HAS_GROOVE_FINDER:
+            messagebox.showerror("Missing module", "find_similar_grooves.py not found alongside this script.")
+            return
+        self._set_status("Loading groove index...", busy=True)
+        threading.Thread(target=self._load_groove_index_worker, args=(path,), daemon=True).start()
+
+    def _load_groove_index_worker(self, path, is_default=False):
+        try:
+            index = fsg.load_index(path)
+        except Exception as exc:
+            msg = _report_error(f"loading groove index '{path}'", exc)
+            self.root.after(0, lambda: self._on_groove_index_load_error(msg, is_default))
+            return
+        self.root.after(0, lambda: self._on_groove_index_loaded(path, index, is_default))
+
+    def _on_groove_index_loaded(self, path, index, is_default=False):
+        self.groove_index = index
+        self.groove_index_path = path
+        n = len(index.get('paths', []))
+        suffix = " (bundled default)" if is_default else ""
+        self.groove_index_label.config(text=f"{os.path.basename(path)}{suffix}  ({n} files)",
+                                       foreground='black')
+        self._set_model_status(self.groove_index_status_dot, 'ok')
+        self._set_status(f"Groove index loaded ({n} files).")
+        # if segments already exist, search each of them now
+        if self.segments and self.drum_path:
+            self._start_groove_batch_search()
+
+    def _on_groove_index_load_error(self, msg, is_default=False):
+        self._set_model_status(self.groove_index_status_dot, 'error')
+        if not is_default:
+            messagebox.showerror("Failed to load groove index", msg)
+        self._set_status("Failed to load groove index.")
+
     # ------------------------------------------------------------------ UI --
     def _build_widgets(self):
         # -- model loaders --
@@ -665,6 +996,14 @@ class StudioApp:
         self.seg_model_label = ttk.Label(top2, text="(none loaded)", foreground='gray')
         self.seg_model_label.pack(side='left', padx=6)
         ttk.Button(top2, text="Load...", command=self._on_load_seg_model).pack(side='right')
+
+        top2b = ttk.Frame(self.root); top2b.pack(fill='x', padx=8, pady=(0, 6))
+        ttk.Label(top2b, text="Groove index:").pack(side='left')
+        self.groove_index_status_dot = tk.Label(top2b, text="●", foreground='#c3c2b7', font=('Segoe UI', 8))
+        self.groove_index_status_dot.pack(side='left', padx=(6, 0))
+        self.groove_index_label = ttk.Label(top2b, text="(none loaded)", foreground='gray')
+        self.groove_index_label.pack(side='left', padx=6)
+        ttk.Button(top2b, text="Load...", command=self._on_load_groove_index).pack(side='right')
 
         # -- segmentation sensitivity --
         # Maps directly to the model's boundary-probability threshold (see
@@ -692,10 +1031,12 @@ class StudioApp:
         # -- drum drop zone --
         drum_label_row = ttk.Frame(self.root); drum_label_row.pack(fill='x', padx=8)
         ttk.Label(drum_label_row, text="Drum MIDI (full song):").pack(side='left')
-        ttk.Button(drum_label_row, text="▶ Audition selected segment",
-                  command=self._on_audition_raw_both).pack(side='right')
-        ttk.Button(drum_label_row, text="▶ Audition selected drum segment",
-                  command=self._on_audition_raw_drum).pack(side='right', padx=(0, 6))
+        both_btn = ttk.Button(drum_label_row, text="▶ Audition selected segment",
+                              command=lambda: self._toggle_audition('both'))
+        both_btn.pack(side='right')
+        drum_btn = ttk.Button(drum_label_row, text="▶ Audition selected drum segment",
+                              command=lambda: self._toggle_audition('drum'))
+        drum_btn.pack(side='right', padx=(0, 6))
         self.drum_drop = tk.Label(self.root, text=self._drop_text("drum"), relief='groove',
                                   bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.drum_drop.pack(fill='x', padx=8, pady=(0, 4))
@@ -713,8 +1054,10 @@ class StudioApp:
         # -- bass drop zone --
         bass_label_row = ttk.Frame(self.root); bass_label_row.pack(fill='x', padx=8, pady=(6, 0))
         ttk.Label(bass_label_row, text="Bass MIDI (matching song, same tempo/alignment):").pack(side='left')
-        ttk.Button(bass_label_row, text="▶ Audition selected bass segment",
-                  command=self._on_audition_raw_bass).pack(side='right')
+        bass_btn = ttk.Button(bass_label_row, text="▶ Audition selected bass segment",
+                              command=lambda: self._toggle_audition('bass'))
+        bass_btn.pack(side='right')
+        self._audition_buttons = {'drum': drum_btn, 'bass': bass_btn, 'both': both_btn}
         self.bass_drop = tk.Label(self.root, text=self._drop_text("bass"), relief='groove',
                                   bd=2, height=6, bg='#f5f5f5', fg='#555', cursor='hand2')
         self.bass_drop.pack(fill='x', padx=8, pady=(0, 6))
@@ -734,13 +1077,27 @@ class StudioApp:
                 except Exception as exc:
                     _report_error("enabling drag-and-drop (falling back to click-to-browse)", exc)
 
+            # OUTBOUND: dragging a segment rectangle OUT of the timeline copies
+            # its current audio to wherever it's dropped (Explorer, another
+            # app, etc) - Windows-only feature, uses OLE2 drag-and-drop under
+            # the hood via tkdnd. See _on_segment_drag_init.
+            for canvas, kind in ((self.seg_canvas, 'drum'), (self.seg_canvas_bass, 'bass')):
+                try:
+                    canvas.drag_source_register(1, DND_FILES)
+                    canvas.dnd_bind('<<DragInitCmd>>',
+                                    lambda e, c=canvas, k=kind: self._on_segment_drag_init(e, c, k))
+                except Exception as exc:
+                    _report_error("enabling segment drag-out", exc)
+
         ttk.Separator(self.root).pack(fill='x', padx=8, pady=4)
 
-        # -- body holding the three phase sections --
+        # -- body holding the groove-swap panel + three phase sections --
         outer = ttk.Frame(self.root); outer.pack(fill='both', expand=True, padx=8)
+        self.groove_section = CollapsibleSection(outer, "Find Similar Groove", start_open=False)
         self.phase1_section = CollapsibleSection(outer, "Phase 1 -- Drum Humanize", start_open=PHASE1_SECTION_STARTS_OPEN)
         self.phase2_section = CollapsibleSection(outer, "Phase 2 -- Rush / Drag", start_open=PHASE2_SECTION_STARTS_OPEN)
         self.phase3_section = CollapsibleSection(outer, "Phase 3 -- Bass Sync", start_open=PHASE3_SECTION_STARTS_OPEN)
+        self._build_groove_section(self.groove_section.body)
         self._build_phase1_controls(self.phase1_section.body)
         self._build_phase2_controls(self.phase2_section.body)
         self._build_phase3_controls(self.phase3_section.body)
@@ -855,6 +1212,7 @@ class StudioApp:
         self.bass_path = path
         self.bass_drop.config(text=os.path.basename(path), foreground='black')
         self._set_status(f"Bass file set: {os.path.basename(path)}")
+        self._draw_timeline()   # segments (if any) now also overlay the bass drop zone
 
     def _load_drum_file(self, path):
         if self.seg_model is None:
@@ -908,17 +1266,78 @@ class StudioApp:
             self._set_status("No segments detected.")
             return
         self._set_status(f"{len(segs)} segments detected -- click one to begin.")
+        if self.groove_index is not None:
+            self._start_groove_batch_search()
+
+    # ---------------------------------------------------- groove similarity --
+    def _start_groove_batch_search(self):
+        """Eagerly searches similar grooves for EVERY detected segment, right
+        after segmentation (or right after a groove index gets loaded, if
+        segments already existed) - not just whichever one the user happens to
+        select. Results are cached on each segment (seg.groove_results), so
+        selecting a segment shows them instantly."""
+        drum_path = self.drum_path
+        segments = list(self.segments)
+        cfg = fsg.Config(**{k: v for k, v in self.groove_index['cfg'].items()
+                            if k in fsg.Config.__dataclass_fields__})
+        threading.Thread(target=self._groove_batch_search_worker,
+                         args=(drum_path, segments, cfg), daemon=True).start()
+
+    def _groove_batch_search_worker(self, drum_path, segments, cfg):
+        for i, seg in enumerate(segments):
+            if drum_path != self.drum_path or self.groove_index is None:
+                return   # a newer file was dropped, or the index changed - abandon
+            error = None
+            results = None
+            try:
+                raw_path, _, _ = slice_midi_to_temp(drum_path, seg.start_sec, seg.end_sec,
+                                                    self.temp_dir, drums_only=True)
+                query_fp = fsg.extract_fingerprint(raw_path, cfg)
+                if query_fp is None:
+                    raise ValueError("Too few drum notes in this segment to search with.")
+                sims = fsg.compute_similarities(query_fp, self.groove_index, cfg)
+                order = np.argsort(-sims)
+                results = []
+                for j in order:
+                    results.append({'path': self.groove_index['paths'][j],
+                                    'similarity': float(sims[j]),
+                                    'tempo': float(self.groove_index['tempo'][j])})
+                    if len(results) >= GROOVE_SEARCH_TOP_K:
+                        break
+            except Exception as exc:
+                error = _report_error(f"searching similar grooves for segment {i+1}", exc)
+            self.root.after(0, lambda seg=seg, results=results, error=error:
+                            self._on_groove_search_done(seg, results, error))
+
+    def _on_groove_search_done(self, seg, results, error):
+        # identity check, not value-equality (SegmentSettings is a dataclass -
+        # `in`/`==` would compare field VALUES, not "is this the same object
+        # still being tracked", which is what staleness actually means here).
+        if not any(s is seg for s in self.segments):
+            return   # stale - segments were reset/re-segmented since this was queued
+        seg.groove_results = results if results is not None else []
+        seg.groove_search_error = error
+        if self._current_segment() is seg:
+            self._refresh_groove_section(seg)
 
     # ------------------------------------------------------------ timeline --
     def _draw_timeline(self):
         """Segment results overlap the drum/bass drop zones themselves (same
         footprint, via place(in_=...)) instead of taking their own row, so they
-        cost no extra vertical space. Both overlays show the same song-structure
-        timeline - it's one set of segments, relevant wherever there's a drop
-        zone for it. place_forget() when there's nothing to show reveals each
-        drop zone's own "Drop ... here" text again."""
+        cost no extra vertical space. place_forget() when there's nothing to
+        show reveals each drop zone's own "Drop ... here" text again.
+
+        The bass overlay specifically only appears once a bass file is
+        actually loaded - segments come from the DRUM file alone, so showing
+        colored segment blocks over an empty "Drop bass MIDI here" zone before
+        any bass file exists would misleadingly look like something's there."""
         self.segment_click_targets = {}
-        overlays = ((self.seg_canvas, self.drum_drop), (self.seg_canvas_bass, self.bass_drop))
+        overlays = [(self.seg_canvas, self.drum_drop)]
+        if self.bass_path:
+            overlays.append((self.seg_canvas_bass, self.bass_drop))
+        else:
+            self.seg_canvas_bass.delete('all')
+            self.seg_canvas_bass.place_forget()
         for canvas, _target in overlays:
             canvas.delete('all')
         if not self.segments:
@@ -977,6 +1396,13 @@ class StudioApp:
                 canvas.create_oval(x + w - 10, y0 + 2, x + w - 2, y0 + 10,
                                    fill=CUSTOMIZED_MARKER_COLOR, outline='',
                                    tags=(f'seg{i}',))
+            if seg.swapped_groove_path:
+                # distinct from the "customized" dot (top-right) - this marks
+                # the segment's SOURCE audio itself has been swapped, a bigger
+                # change than a settings tweak.
+                canvas.create_rectangle(x + 2, y0 + 2, x + 10, y0 + 10,
+                                        fill=SWAPPED_GROOVE_MARKER_COLOR, outline='#333',
+                                        tags=(f'seg{i}',))
             canvas.tag_bind(f'seg{i}', '<Button-1>', lambda e, idx=i: self._on_segment_selected(idx))
             if is_drum_canvas:
                 self.segment_click_targets[i] = {'rect': rect, 'x0': x, 'x1': x + w}
@@ -988,6 +1414,7 @@ class StudioApp:
         self._restore_segment_to_widgets(self.segments[idx])
         self._refresh_gating()
         seg = self.segments[idx]
+        self._refresh_groove_section(seg)
         self._set_status(f"Segment {idx+1} selected (measures {seg.start_bar+1}-{seg.end_bar}).")
 
     # ------------------------------------------------------------- gating --
@@ -996,9 +1423,87 @@ class StudioApp:
             return None
         return self.segments[self.selected_index]
 
+    def _phase1_raw_input(self, seg: SegmentSettings) -> str:
+        """The audio Phase 1 (Humanize) should actually run on: the swapped-in
+        library groove if one's active for this segment, else a fresh slice of
+        the original recording. Always returns an existing file."""
+        if seg.swapped_groove_path and os.path.exists(seg.swapped_groove_path):
+            return seg.swapped_groove_path
+        raw_path, _, _ = slice_midi_to_temp(self.drum_path, seg.start_sec, seg.end_sec,
+                                            self.temp_dir, drums_only=True)
+        return raw_path
+
+    def _current_segment_drum_path(self, seg: SegmentSettings) -> str:
+        """Best-available drum audio for this segment RIGHT NOW: the most-
+        processed phase output if one exists, else the swapped-in groove if
+        one's active, else a fresh raw slice of the original recording.
+        Always returns an existing file - used by the render step and by
+        dragging a segment out of the timeline."""
+        path = seg.phase2_output_path or seg.phase1_output_path or seg.swapped_groove_path
+        if path and os.path.exists(path):
+            return path
+        raw_path, _, _ = slice_midi_to_temp(self.drum_path, seg.start_sec, seg.end_sec,
+                                            self.temp_dir, drums_only=True)
+        return raw_path
+
+    def _current_segment_bass_path(self, seg: SegmentSettings) -> Optional[str]:
+        """Best-available BASS audio for this segment right now, for dragging
+        a segment out of the bass timeline. None if no bass file is loaded."""
+        if not self.bass_path:
+            return None
+        path = seg.phase3_output_path or seg.bass_input_path
+        if path and os.path.exists(path):
+            return path
+        raw_path, _, _ = slice_midi_to_temp(self.bass_path, seg.start_sec, seg.end_sec,
+                                            self.temp_dir, drums_only=False, program=33)
+        return raw_path
+
+    def _segment_index_at_x(self, canvas, x) -> Optional[int]:
+        """Which segment (by index) sits at local x-coordinate x within canvas,
+        using the SAME width computation _draw_segments_on uses - kept separate
+        from segment_click_targets since that's only tracked for the drum
+        canvas, while this needs to work for either overlay canvas."""
+        if not self.segments:
+            return None
+        canvas_w = max(1, canvas.winfo_width())
+        total_bars = sum(s.end_bar - s.start_bar for s in self.segments)
+        if total_bars <= 0:
+            return None
+        acc = 0
+        for i, seg in enumerate(self.segments):
+            length = seg.end_bar - seg.start_bar
+            w = max(SEGMENT_MIN_RECT_WIDTH_PX, round(canvas_w * length / total_bars))
+            if acc <= x < acc + w:
+                return i
+            acc += w
+        return len(self.segments) - 1 if self.segments and x >= acc else None
+
+    def _on_segment_drag_init(self, event, canvas, kind):
+        """<<DragInitCmd>> handler for dragging a segment rectangle out of the
+        timeline. Must return (action, types, data) per tkinterdnd2's
+        contract, or None to refuse the drag. data is a real file path - tkdnd
+        hands it to the OS as an OLE2 CF_HDROP, so dropping it onto Explorer
+        (or any app that accepts dropped files) COPIES that file there."""
+        idx = self._segment_index_at_x(canvas, event.x_root - canvas.winfo_rootx())
+        if idx is None:
+            return None
+        seg = self.segments[idx]
+        try:
+            path = self._current_segment_drum_path(seg) if kind == 'drum' else self._current_segment_bass_path(seg)
+        except Exception as exc:
+            _report_error(f"preparing segment {idx+1} for drag-out", exc)
+            return None
+        if not path:
+            return None
+        # forward slashes - Windows accepts them interchangeably, and this
+        # sidesteps any risk of a backslash being misread as a Tcl escape
+        # character during tkdnd's native OLE handoff.
+        return (COPY, DND_FILES, path.replace('\\', '/'))
+
     def _refresh_gating(self):
         seg = self._current_segment()
         has_seg = seg is not None
+        self.groove_section.set_enabled(has_seg and self.groove_index is not None)
         self.phase1_section.set_enabled(has_seg)
         self.phase2_section.set_enabled(has_seg and seg.phase1_done)
         self.phase3_section.set_enabled(has_seg and seg.phase2_done and self.bass_path is not None)
@@ -1083,6 +1588,212 @@ class StudioApp:
         self._save_widgets_to_segment(seg)
         self._draw_timeline()   # the "customized" dot may need to appear/disappear
 
+    # ==================================================== FIND SIMILAR GROOVE
+    def _build_groove_section(self, parent):
+        """Lets you replace the SELECTED segment's original drum recording
+        with a similar groove from the library (see fit_groove_to_segment),
+        before running Phase 1 onward. Results are searched eagerly for every
+        segment as soon as segmentation completes (see _start_groove_batch_
+        search) so switching segments shows them instantly."""
+        self.groove_status_label = ttk.Label(parent, text="Select a segment to see similar grooves.",
+                                             foreground='gray')
+        self.groove_status_label.pack(anchor='w', padx=8, pady=(4, 2))
+
+        list_frame = ttk.Frame(parent); list_frame.pack(fill='x', padx=8, pady=(0, 4))
+        self.groove_tree = ttk.Treeview(list_frame, columns=('rank', 'sim', 'file'),
+                                        show='headings', selectmode='browse', height=10)
+        self.groove_tree.heading('rank', text='#')
+        self.groove_tree.column('rank', width=32, anchor='center', stretch=False)
+        self.groove_tree.heading('sim', text='Similarity')
+        self.groove_tree.column('sim', width=80, anchor='center', stretch=False)
+        self.groove_tree.heading('file', text='File')
+        self.groove_tree.column('file', width=300, anchor='w')
+        vsb = ttk.Scrollbar(list_frame, orient='vertical', command=self.groove_tree.yview)
+        self.groove_tree.configure(yscrollcommand=vsb.set)
+        self.groove_tree.pack(side='left', fill='x', expand=True)
+        vsb.pack(side='right', fill='y')
+        self.groove_tree.bind('<<TreeviewSelect>>', self._on_groove_row_select)
+        self.groove_tree.bind('<Double-Button-1>', self._on_groove_row_double_click)
+        if HAS_DND:
+            # OUTBOUND: dragging a row out of the results list copies that
+            # library groove file to wherever it's dropped - same mechanism
+            # (and same COPY action) as dragging a segment out of the timeline.
+            try:
+                self.groove_tree.drag_source_register(1, DND_FILES)
+                self.groove_tree.dnd_bind('<<DragInitCmd>>', self._on_groove_row_drag_init)
+            except Exception as exc:
+                _report_error("enabling groove-list drag-out", exc)
+
+        btnrow = ttk.Frame(parent); btnrow.pack(fill='x', padx=8, pady=(0, 6))
+        self.groove_audition_btn = ttk.Button(btnrow, text="▶ Audition",
+                                              command=self._on_groove_audition, state='disabled')
+        self.groove_audition_btn.pack(side='left')
+        self._audition_buttons['groove'] = self.groove_audition_btn
+        self.groove_use_btn = ttk.Button(btnrow, text="Use this groove",
+                                         command=self._on_use_groove, state='disabled')
+        self.groove_use_btn.pack(side='left', padx=6)
+        self.groove_revert_btn = ttk.Button(btnrow, text="Revert to original",
+                                            command=self._on_revert_groove, state='disabled')
+        self.groove_revert_btn.pack(side='left')
+
+    def _refresh_groove_section(self, seg: Optional[SegmentSettings]):
+        for iid in self.groove_tree.get_children():
+            self.groove_tree.delete(iid)
+        self.groove_selected_result = None
+        self.groove_audition_btn.config(state='disabled')
+        self.groove_use_btn.config(state='disabled')
+        if seg is None:
+            self.groove_status_label.config(text="Select a segment to see similar grooves.",
+                                            foreground='gray')
+            self.groove_revert_btn.config(state='disabled')
+            return
+        self.groove_revert_btn.config(state='normal' if seg.swapped_groove_path else 'disabled')
+        if seg.swapped_groove_path:
+            using = f"Using: {os.path.basename(seg.swapped_groove_source or seg.swapped_groove_path)}"
+        else:
+            using = "Using: original recording"
+        if seg.groove_results is None:
+            suffix = "load a groove index to search" if self.groove_index is None else "searching..."
+            self.groove_status_label.config(text=f"{using}  -  {suffix}",
+                                            foreground='gray' if self.groove_index is None else '#0066cc')
+            return
+        if seg.groove_search_error:
+            self.groove_status_label.config(text=f"{using}  -  search failed (see console).",
+                                            foreground='#b00000')
+            return
+        for i, r in enumerate(seg.groove_results, 1):
+            self.groove_tree.insert('', 'end', iid=str(i - 1),
+                                    values=(i, f"{r['similarity']:.3f}", os.path.basename(r['path'])))
+        n = len(seg.groove_results)
+        self.groove_status_label.config(
+            text=f"{using}  -  {n} similar groove{'s' if n != 1 else ''} found.", foreground='gray')
+
+    def _on_groove_row_select(self, event=None):
+        sel = self.groove_tree.selection()
+        seg = self._current_segment()
+        if not sel or seg is None or not seg.groove_results:
+            self.groove_selected_result = None
+            self.groove_audition_btn.config(state='disabled')
+            self.groove_use_btn.config(state='disabled')
+            return
+        self.groove_selected_result = seg.groove_results[int(sel[0])]
+        self.groove_audition_btn.config(state='normal')
+        self.groove_use_btn.config(state='normal')
+
+    def _on_groove_row_double_click(self, event):
+        """Double-click a row to play it; double-click again (or the row
+        currently playing) to stop - same toggle _on_groove_audition already
+        implements for the Audition button, just reachable straight from the
+        list too."""
+        row_iid = self.groove_tree.identify_row(event.y)
+        if row_iid:
+            self.groove_tree.selection_set(row_iid)
+            self._on_groove_row_select()
+        self._on_groove_audition()
+
+    def _on_groove_row_drag_init(self, event):
+        """<<DragInitCmd>> for the results list - drag whichever row is under
+        the pointer, regardless of which row (if any) is currently selected,
+        matching how file browsers let you drag an unselected row directly."""
+        seg = self._current_segment()
+        if seg is None or not seg.groove_results:
+            return None
+        local_y = event.y_root - self.groove_tree.winfo_rooty()
+        row_iid = self.groove_tree.identify_row(local_y)
+        if not row_iid:
+            return None
+        try:
+            result = seg.groove_results[int(row_iid)]
+        except (ValueError, IndexError):
+            return None
+        path = result['path']
+        if not path or not os.path.exists(path):
+            return None
+        return (COPY, DND_FILES, path.replace('\\', '/'))
+
+    def _on_groove_audition(self):
+        """Toggles like the drum/bass/both audition buttons (see
+        _toggle_audition) - only one of the four can ever be playing, sharing
+        the same play/stop icon state via _set_audition_playing."""
+        if self.playing_kind == 'groove':
+            if self.player is not None:
+                self.player.stop()
+            self._set_audition_playing(None)
+            self._set_status("Stopped.")
+            return
+        if self.groove_selected_result is None or self.player is None:
+            return
+        seg = self._current_segment()
+        path = self.groove_selected_result['path']
+        target_tempo = 120.0
+        if seg is not None and self.drum_path:
+            target_tempo = _tempo_at_time(pretty_midi.PrettyMIDI(self.drum_path), seg.start_sec)
+        native_tempo = self.groove_selected_result.get('tempo') or 120.0
+        tempo_scale = (target_tempo / native_tempo) if native_tempo > 0 else 1.0
+        self._set_audition_playing('groove')
+        self._set_status(f"Auditioning '{os.path.basename(path)}'...", busy=True)
+        threading.Thread(target=self._groove_audition_worker, args=(path, tempo_scale), daemon=True).start()
+
+    def _groove_audition_worker(self, path, tempo_scale):
+        try:
+            # force_drum_channel=True - this is a pure drum library file being
+            # previewed on its own.
+            self.player.play(path, tempo_scale=tempo_scale, force_drum_channel=True,
+                             on_finished=lambda err: self.root.after(
+                                 0, lambda: self._on_audition_playback_finished('groove', err)))
+        except Exception as exc:
+            msg = _report_error(f"auditioning '{path}'", exc)
+            self.root.after(0, lambda: self._on_audition_playback_finished('groove', msg))
+
+    def _on_use_groove(self):
+        seg = self._current_segment()
+        if seg is None or self.groove_selected_result is None or self.drum_path is None:
+            return
+        groove_path = self.groove_selected_result['path']
+        target_bars = seg.end_bar - seg.start_bar
+        target_tempo = _tempo_at_time(pretty_midi.PrettyMIDI(self.drum_path), seg.start_sec)
+        self._set_status(f"Fitting '{os.path.basename(groove_path)}' to segment {seg.index+1}...", busy=True)
+        threading.Thread(target=self._use_groove_worker,
+                         args=(seg, groove_path, target_bars, target_tempo), daemon=True).start()
+
+    def _use_groove_worker(self, seg, groove_path, target_bars, target_tempo):
+        try:
+            fitted_path = fit_groove_to_segment(groove_path, target_bars, target_tempo, self.temp_dir)
+        except Exception as exc:
+            msg = _report_error(f"fitting groove for segment {seg.index+1}", exc)
+            self.root.after(0, lambda: messagebox.showerror("Could not use this groove", msg))
+            return
+        self.root.after(0, lambda: self._on_groove_swapped(seg, fitted_path, groove_path))
+
+    def _on_groove_swapped(self, seg: SegmentSettings, fitted_path, source_path):
+        seg.swapped_groove_path = fitted_path
+        seg.swapped_groove_source = source_path
+        # downstream phase outputs were computed on the OLD input - clear them
+        # rather than just flagging "stale", since showing them at all now
+        # would be actively wrong (different source audio entirely).
+        seg.phase1_done = seg.phase2_done = seg.phase3_done = False
+        seg.phase1_output_path = seg.phase2_output_path = seg.phase3_output_path = None
+        seg.phase1_raw_path = None
+        if self._current_segment() is seg:
+            self._refresh_groove_section(seg)
+        self._refresh_gating()
+        self._draw_timeline()
+        self._set_status(f"Segment {seg.index+1} now uses '{os.path.basename(source_path)}'.")
+
+    def _on_revert_groove(self):
+        seg = self._current_segment()
+        if seg is None or not seg.swapped_groove_path:
+            return
+        seg.swapped_groove_path = None
+        seg.swapped_groove_source = None
+        seg.phase1_done = seg.phase2_done = seg.phase3_done = False
+        seg.phase1_output_path = seg.phase2_output_path = seg.phase3_output_path = None
+        seg.phase1_raw_path = None
+        self._refresh_groove_section(seg)
+        self._refresh_gating()
+        self._draw_timeline()
+        self._set_status(f"Segment {seg.index+1} reverted to the original recording.")
+
     # ============================================================ PHASE 1 ==
     def _build_phase1_controls(self, parent):
         self.var_strength = tk.DoubleVar(value=PHASE1_DEFAULT_STRENGTH)
@@ -1128,8 +1839,7 @@ class StudioApp:
 
     def _run_phase1_worker(self, seg: SegmentSettings):
         try:
-            raw_path, tempo, n = slice_midi_to_temp(self.drum_path, seg.start_sec, seg.end_sec,
-                                                     self.temp_dir, drums_only=True)
+            raw_path = self._phase1_raw_input(seg)
             out_path = os.path.join(self.temp_dir, f"seg{seg.index}_phase1_{uuid.uuid4().hex[:6]}.mid")
             run_phase1_humanize(self.hum_checkpoint_path, raw_path, out_path, seg.phase1_settings)
         except Exception as exc:
@@ -1181,8 +1891,7 @@ class StudioApp:
         for s in self.segments:
             s.phase1_settings = dict(settings_copy)
             try:
-                raw_path, tempo, n = slice_midi_to_temp(self.drum_path, s.start_sec, s.end_sec,
-                                                         self.temp_dir, drums_only=True)
+                raw_path = self._phase1_raw_input(s)
                 out_path = os.path.join(self.temp_dir, f"seg{s.index}_phase1_{uuid.uuid4().hex[:6]}.mid")
                 run_phase1_humanize(self.hum_checkpoint_path, raw_path, out_path, s.phase1_settings)
                 s.phase1_output_path = out_path
@@ -1411,20 +2120,54 @@ class StudioApp:
             return
         self.playing_path = path
         self._set_status(f"Playing {which} preview...")
-        threading.Thread(target=self._audition_worker, args=(path,), daemon=True).start()
+        # phase1/phase1_raw/phase2 are drum-track outputs; phase3 is the bass-sync
+        # output - only force the drum channel for the former, or phase3 would
+        # play back sounding like drums instead of bass (see MidiPlayer.play()).
+        force_drum_channel = (which != 'phase3')
+        threading.Thread(target=self._audition_worker, args=(path, force_drum_channel),
+                         daemon=True).start()
 
-    def _audition_worker(self, path):
+    def _audition_worker(self, path, force_drum_channel=True):
         try:
-            self.player.play(path, on_finished=lambda err: self.root.after(
-                0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
+            self.player.play(path, force_drum_channel=force_drum_channel,
+                             on_finished=lambda err: self.root.after(
+                                 0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
         except Exception as exc:
             msg = _report_error(f"auditioning '{path}'", exc)
             self.root.after(0, lambda: self._set_status(msg))
 
-    def _on_audition_raw_both(self):
-        """Play the selected segment's raw drum + bass together, perfectly in
-        sync (see audition_both_to_temp) - bass is optional (drum-only if no
-        bass file is loaded yet)."""
+    def _set_audition_playing(self, kind):
+        """Refreshes all three segment-audition buttons' icons: the active one
+        (if any) shows the stop icon, the others show the play icon. kind=None
+        means nothing is playing - every button shows play."""
+        self.playing_kind = kind
+        for k, btn in self._audition_buttons.items():
+            icon = '■' if k == kind else '▶'   # ■ stop / ▶ play
+            label = btn.cget('text').split(' ', 1)[1]     # keep everything after the icon
+            btn.config(text=f"{icon} {label}")
+
+    def _on_audition_playback_finished(self, kind, err):
+        """Shared on_finished for all three buttons. Guarded on kind so a stale
+        callback from a playback that got superseded by a DIFFERENT button (or
+        stopped explicitly) can't clobber whichever one is actually active now -
+        see _play_worker's `finally: on_finished(error)`, which fires even when
+        playback was interrupted by a newer play() call or an explicit stop()."""
+        if self.playing_kind == kind:
+            self._set_audition_playing(None)
+        self._set_status(f"Playback error: {err}" if err else "Ready.")
+
+    def _toggle_audition(self, kind):
+        """Bound to all three segment-audition buttons (drum/bass/both). Clicking
+        the button for whatever's currently playing stops it; clicking any other
+        one starts it - which, via MidiPlayer.play()'s own stop-before-play,
+        also stops whatever else was playing (only one of drum/bass/both plays
+        at a time, matching there being one player)."""
+        if self.playing_kind == kind:
+            if self.player is not None:
+                self.player.stop()
+            self._set_audition_playing(None)
+            self._set_status("Stopped.")
+            return
         seg = self._current_segment()
         if seg is None:
             messagebox.showinfo("Select a segment", "Select a segment first (click one in "
@@ -1432,56 +2175,44 @@ class StudioApp:
             return
         if self.player is None:
             return
-        if not self.drum_path:
-            messagebox.showinfo("Nothing to play", "Load a drum MIDI file first.")
+        source_path = self.drum_path if kind in ('drum', 'both') else self.bass_path
+        if not source_path:
+            messagebox.showinfo("Nothing to play", f"Load a {'drum' if kind == 'both' else kind} "
+                                "MIDI file first.")
             return
-        self._set_status(f"Auditioning segment {seg.index+1} (drum+bass)...", busy=True)
-        threading.Thread(target=self._audition_raw_both_worker,
-                         args=(self.drum_path, self.bass_path, seg.start_sec, seg.end_sec),
-                         daemon=True).start()
+        self._set_audition_playing(kind)
+        self._set_status(f"Auditioning segment {seg.index+1} ({kind})...", busy=True)
+        if kind == 'both':
+            threading.Thread(target=self._audition_raw_both_worker,
+                             args=(self.drum_path, self.bass_path, seg.start_sec, seg.end_sec),
+                             daemon=True).start()
+        else:
+            threading.Thread(target=self._audition_raw_worker,
+                             args=(kind, source_path, seg.start_sec, seg.end_sec), daemon=True).start()
 
     def _audition_raw_both_worker(self, drum_path, bass_path, start_sec, end_sec):
         try:
             path = audition_both_to_temp(drum_path, bass_path, start_sec, end_sec, self.temp_dir)
         except Exception as exc:
             msg = _report_error("building combined drum+bass audition slice", exc)
-            self.root.after(0, lambda: self._set_status(msg))
+            self.root.after(0, lambda: self._on_audition_playback_finished('both', msg))
             return
         self.playing_path = path
         try:
-            self.player.play(path, on_finished=lambda err: self.root.after(
-                0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
+            # force_drum_channel=False - this file already carries the correct
+            # per-instrument is_drum/program (drum + bass), forcing everything to
+            # the drum channel would make the bass part sound like drums too.
+            self.player.play(path, force_drum_channel=False, on_finished=lambda err: self.root.after(
+                0, lambda: self._on_audition_playback_finished('both', err)))
         except Exception as exc:
             msg = _report_error(f"auditioning '{path}'", exc)
-            self.root.after(0, lambda: self._set_status(msg))
+            self.root.after(0, lambda: self._on_audition_playback_finished('both', msg))
 
-    def _on_audition_raw_drum(self):
-        self._on_audition_raw_segment('drum')
-
-    def _on_audition_raw_bass(self):
-        self._on_audition_raw_segment('bass')
-
-    def _on_audition_raw_segment(self, kind):
-        """Play the currently selected segment's RAW (unprocessed) span straight
+    def _audition_raw_worker(self, kind, source_path, start_sec, end_sec):
+        """Plays the currently selected segment's RAW (unprocessed) span straight
         from the source file, forced to a drum kit or bass sound respectively -
         regardless of what channel/program the source file itself used - so it's
         always audible as intended even before any phase has run."""
-        seg = self._current_segment()
-        if seg is None:
-            messagebox.showinfo("Select a segment", "Select a segment first (click one in "
-                                "the timeline above).")
-            return
-        if self.player is None:
-            return
-        source_path = self.drum_path if kind == 'drum' else self.bass_path
-        if not source_path:
-            messagebox.showinfo("Nothing to play", f"Load a {kind} MIDI file first.")
-            return
-        self._set_status(f"Auditioning segment {seg.index+1} ({kind})...", busy=True)
-        threading.Thread(target=self._audition_raw_worker,
-                         args=(kind, source_path, seg.start_sec, seg.end_sec), daemon=True).start()
-
-    def _audition_raw_worker(self, kind, source_path, start_sec, end_sec):
         try:
             if kind == 'drum':
                 path, _, _ = slice_midi_to_temp(source_path, start_sec, end_sec,
@@ -1493,15 +2224,18 @@ class StudioApp:
                                                 self.temp_dir, drums_only=False, program=33)
         except Exception as exc:
             msg = _report_error(f"slicing segment for {kind} audition", exc)
-            self.root.after(0, lambda: self._set_status(msg))
+            self.root.after(0, lambda: self._on_audition_playback_finished(kind, msg))
             return
         self.playing_path = path
         try:
-            self.player.play(path, on_finished=lambda err: self.root.after(
-                0, lambda: self._set_status(f"Playback error: {err}" if err else "Ready.")))
+            # Only force the drum channel for the drum slice - the bass slice
+            # already carries program=33 correctly and must not be overridden.
+            self.player.play(path, force_drum_channel=(kind == 'drum'),
+                             on_finished=lambda err: self.root.after(
+                                 0, lambda: self._on_audition_playback_finished(kind, err)))
         except Exception as exc:
             msg = _report_error(f"auditioning '{path}'", exc)
-            self.root.after(0, lambda: self._set_status(msg))
+            self.root.after(0, lambda: self._on_audition_playback_finished(kind, msg))
 
     # ---------------------------------------------------------------- reset --
     def _on_reset_segment(self):
@@ -1516,6 +2250,7 @@ class StudioApp:
         self._restore_segment_to_widgets(seg)
         self._refresh_gating()
         self._draw_timeline()
+        self._refresh_groove_section(seg)
         self._set_status(f"Segment {seg.index+1} reset.")
 
     # --------------------------------------------------------------- render --
@@ -1551,23 +2286,15 @@ class StudioApp:
             bass_inst = pretty_midi.Instrument(program=33, is_drum=False) if bass_out else None
 
             for seg in self.segments:
-                drum_src_path = seg.phase2_output_path or seg.phase1_output_path
-                if drum_src_path and os.path.exists(drum_src_path):
-                    src = pretty_midi.PrettyMIDI(drum_src_path)
-                    for inst in src.instruments:
-                        for n in inst.notes:
-                            drum_inst.notes.append(pretty_midi.Note(
-                                velocity=n.velocity, pitch=n.pitch,
-                                start=n.start + seg.start_sec, end=n.end + seg.start_sec))
-                elif os.path.exists(self.drum_path):
-                    raw_path, _, _ = slice_midi_to_temp(self.drum_path, seg.start_sec, seg.end_sec,
-                                                        self.temp_dir, drums_only=True)
-                    src = pretty_midi.PrettyMIDI(raw_path)
-                    for inst in src.instruments:
-                        for n in inst.notes:
-                            drum_inst.notes.append(pretty_midi.Note(
-                                velocity=n.velocity, pitch=n.pitch,
-                                start=n.start + seg.start_sec, end=n.end + seg.start_sec))
+                # phase2 output > phase1 output > swapped-in groove > fresh raw
+                # slice of the original recording - see _current_segment_drum_path.
+                drum_src_path = self._current_segment_drum_path(seg)
+                src = pretty_midi.PrettyMIDI(drum_src_path)
+                for inst in src.instruments:
+                    for n in inst.notes:
+                        drum_inst.notes.append(pretty_midi.Note(
+                            velocity=n.velocity, pitch=n.pitch,
+                            start=n.start + seg.start_sec, end=n.end + seg.start_sec))
 
                 if bass_out and seg.phase3_output_path and os.path.exists(seg.phase3_output_path):
                     src = pretty_midi.PrettyMIDI(seg.phase3_output_path)

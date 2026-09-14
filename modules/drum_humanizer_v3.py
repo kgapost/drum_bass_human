@@ -2267,10 +2267,12 @@ def scan_previous_runs(current_fp: Dict, exclude=(), ckpt_root: str = 'checkpoin
 
 GRID_RESULTS_FILE = os.path.join('checkpoints', 'grid_results.json')
 
-# DESIGN: resolved against THIS FILE's directory, not the current working
-# directory - --mode infer and drum_bass_studio.py can both be launched from
-# anywhere, and the bundled pretrained model should be found either way.
-PRETRAINED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pretrained')
+# DESIGN: resolved against the PROJECT ROOT (this file's directory's parent -
+# this file lives in modules/), not the current working directory - --mode
+# infer and drum_bass_studio.py can both be launched from anywhere, and the
+# bundled pretrained model (kept at the project root, not inside modules/)
+# should be found either way.
+PRETRAINED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'pretrained')
 DEFAULT_PRETRAINED_CHECKPOINT = os.path.join(PRETRAINED_DIR, 'humanizer_best.pt')
 DEFAULT_PRETRAINED_METADATA = os.path.join(PRETRAINED_DIR, 'humanizer_metadata.json')
 

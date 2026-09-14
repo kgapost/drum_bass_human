@@ -12,4 +12,3 @@ checkpoints.bak/
 *.code-workspace
 .DS_Store
 pretrained/
-groove_finder_settings.json

@@ -222,8 +222,9 @@ GROUP_OTHER = (2, 3, 7, 8, 9, 10, 11, 12)   # hihat + cymbals + perc + other
 # exact proportional share (a deliberate, minor accuracy-for-usability trade).
 SEGMENT_MIN_RECT_WIDTH_PX = 2
 SEGMENT_OUTLINE_WIDTH_NORMAL = 2     # unselected segment border
-SEGMENT_OUTLINE_WIDTH_SELECTED = 4   # selected segment border -- thicker, so the
-                                      # currently-active segment is unambiguous at a glance
+SEGMENT_OUTLINE_WIDTH_SELECTED = 2   # selected segment border -- same weight as normal
+                                      # (a thick 4px border read as a "3D bezel" look);
+                                      # SELECTED_OUTLINE_COLOR alone marks the active one
 
 SEGMENT_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
                   "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD"]
@@ -241,6 +242,24 @@ CUSTOMIZED_MARKER_COLOR = "#FFD400"   # small dot drawn on any segment whose set
 PHASE1_SECTION_STARTS_OPEN = True
 PHASE2_SECTION_STARTS_OPEN = False
 PHASE3_SECTION_STARTS_OPEN = False
+
+
+# =============================================================================
+# PRETRAINED MODELS (auto-download from a shared Google Drive folder)
+# =============================================================================
+# Used by download_pretrained.py, which drum_bass_studio.py calls at startup.
+
+# The shared Drive FOLDER's id, not individual file ids - matching by filename
+# inside the folder (see download_pretrained.py) means re-uploading a better
+# model in Drive is picked up automatically with no code change here. Both
+# models live side by side in this one folder:
+# https://drive.google.com/drive/folders/1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye
+PRETRAINED_DRIVE_FOLDER_ID = '1Q7PnRZUZ5Xm1V9DnC1PX3jJHGW2d45Ye'
+
+PRETRAINED_HUMANIZER_CKPT_NAME = 'humanizer_best.pt'
+PRETRAINED_HUMANIZER_META_NAME = 'humanizer_metadata.json'
+PRETRAINED_SEGMENTATION_CKPT_NAME = 'segmentation_best.pt'
+PRETRAINED_SEGMENTATION_META_NAME = 'segmentation_metadata.json'
 
 
 # =============================================================================
