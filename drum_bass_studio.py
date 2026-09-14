@@ -55,6 +55,7 @@ import json
 import time
 import uuid
 import shutil
+import zipfile
 import random
 import tempfile
 import threading
@@ -84,8 +85,8 @@ try:
 except ImportError:
     HAS_DND = False
 
-# sibling project scripts must be alongside this file
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# sibling project scripts (config.py, drum_humanizer_v3.py, etc.) live in modules/
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modules'))
 try:
     import drum_humanizer_v3 as dhu
     HAS_HUMANIZER = True
@@ -110,17 +111,20 @@ try:
 except ImportError:
     HAS_GROOVE_FINDER = False
 
-# DESIGN: resolved against THIS FILE's directory, not the current working
-# directory - same reasoning as the pretrained-model paths - so the bundled
-# index is found regardless of where this script is launched from.
-DEFAULT_GROOVE_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         'cache', 'groove_index.pkl')
+# DESIGN: resolved relative to THIS FILE's directory (the project root), not
+# the current working directory - so the bundled index is found regardless of
+# where this script is launched from.
+DEFAULT_GROOVE_INDEX_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'cache', 'groove_index.pkl')
 GROOVE_SEARCH_TOP_K = 20  # candidates cached per segment, shown in the results list
 SWAPPED_GROOVE_MARKER_COLOR = '#FFFFFF'   # timeline marker: this segment's source
                                           # audio was swapped for a library groove -
                                           # white (+ outline) reads clearly against
                                           # every SEGMENT_COLORS entry, unlike a
                                           # picked hue that could clash with one
+
+SESSION_FILE_EXT = '.dbhproj'
+SESSION_FILE_VERSION = 1   # bump whenever the session.json schema changes incompatibly
 
 
 # =============================================================================
@@ -839,6 +843,11 @@ class StudioApp:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.drum_path: Optional[str] = None
+        self.drum_original_path: Optional[str] = None   # the file AS DROPPED, before
+                                                         # force_all_drums_to_temp - needed
+                                                         # to reload it fresh on session load,
+                                                         # since the forced temp copy doesn't
+                                                         # survive an app restart
         self.bass_path: Optional[str] = None
         self.segments: List[SegmentSettings] = []
         self.selected_index: Optional[int] = None
@@ -979,7 +988,22 @@ class StudioApp:
         self._set_status("Failed to load groove index.")
 
     # ------------------------------------------------------------------ UI --
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Save Session...", command=self._on_save_session,
+                              accelerator="Ctrl+S")
+        file_menu.add_command(label="Load Session...", command=self._on_load_session,
+                              accelerator="Ctrl+O")
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.root.config(menu=menubar)
+        self.root.bind('<Control-s>', lambda e: self._on_save_session())
+        self.root.bind('<Control-o>', lambda e: self._on_load_session())
+
     def _build_widgets(self):
+        self._build_menu()
         # -- model loaders --
         top = ttk.Frame(self.root); top.pack(fill='x', padx=8, pady=(8, 2))
         ttk.Label(top, text="Humanizer model:").pack(side='left')
@@ -1088,6 +1112,26 @@ class StudioApp:
                                     lambda e, c=canvas, k=kind: self._on_segment_drag_init(e, c, k))
                 except Exception as exc:
                     _report_error("enabling segment drag-out", exc)
+
+        # -- segment navigation: move between segments without needing to
+        # click the exact timeline rectangle (fiddly on a song with many
+        # short segments) - also doubles as a position indicator. ----------
+        nav_row = ttk.Frame(self.root); nav_row.pack(fill='x', padx=8, pady=(4, 0))
+        self.prev_segment_btn = ttk.Button(nav_row, text="◀ Previous Segment",
+                                           command=self._on_prev_segment, state='disabled')
+        self.prev_segment_btn.pack(side='left')
+        self.segment_nav_label = ttk.Label(nav_row, text="No segments yet",
+                                           foreground='gray', anchor='center')
+        self.segment_nav_label.pack(side='left', fill='x', expand=True)
+        self.next_segment_btn = ttk.Button(nav_row, text="Next Segment ▶",
+                                           command=self._on_next_segment, state='disabled')
+        self.next_segment_btn.pack(side='right')
+        # Ctrl+Arrow rather than a bare arrow key - a bare Left/Right would
+        # collide with the normal keyboard behavior of whatever widget
+        # currently has focus (a Scale, a Spinbox, the groove Treeview's own
+        # row navigation), so this needs to be unambiguous and global.
+        self.root.bind('<Control-Right>', lambda e: self._on_next_segment())
+        self.root.bind('<Control-Left>', lambda e: self._on_prev_segment())
 
         ttk.Separator(self.root).pack(fill='x', padx=8, pady=4)
 
@@ -1226,10 +1270,12 @@ class StudioApp:
             messagebox.showerror("Failed to load drum MIDI", msg)
             return
         self.drum_path = forced_path
+        self.drum_original_path = path
         self.drum_drop.config(text=os.path.basename(path), foreground='black')
         self.selected_index = None
         self.segments = []
         self._draw_timeline()   # clears + hides both overlays, revealing the drop zones again
+        self._update_segment_nav_label()
         self._set_status(f"Segmenting '{os.path.basename(path)}'...", busy=True)
         threading.Thread(target=self._segment_worker, args=(forced_path, self.seg_threshold_var.get()),
                          daemon=True).start()
@@ -1262,6 +1308,7 @@ class StudioApp:
             return   # a newer file was dropped before this finished
         self.segments = segs
         self._draw_timeline()
+        self._update_segment_nav_label()
         if not segs:
             self._set_status("No segments detected.")
             return
@@ -1415,7 +1462,40 @@ class StudioApp:
         self._refresh_gating()
         seg = self.segments[idx]
         self._refresh_groove_section(seg)
+        self._update_segment_nav_label()
         self._set_status(f"Segment {idx+1} selected (measures {seg.start_bar+1}-{seg.end_bar}).")
+
+    def _on_next_segment(self, event=None):
+        if not self.segments:
+            return
+        idx = 0 if self.selected_index is None else min(self.selected_index + 1, len(self.segments) - 1)
+        if idx == self.selected_index:
+            return
+        self._on_segment_selected(idx)
+
+    def _on_prev_segment(self, event=None):
+        if not self.segments:
+            return
+        idx = 0 if self.selected_index is None else max(self.selected_index - 1, 0)
+        if idx == self.selected_index:
+            return
+        self._on_segment_selected(idx)
+
+    def _update_segment_nav_label(self):
+        n = len(self.segments)
+        if n == 0:
+            self.segment_nav_label.config(text="No segments yet")
+            self.prev_segment_btn.config(state='disabled')
+            self.next_segment_btn.config(state='disabled')
+            return
+        if self.selected_index is None:
+            self.segment_nav_label.config(text=f"{n} segment{'s' if n != 1 else ''} detected - none selected")
+            self.prev_segment_btn.config(state='disabled')
+            self.next_segment_btn.config(state='normal')
+            return
+        self.segment_nav_label.config(text=f"Segment {self.selected_index + 1} of {n}")
+        self.prev_segment_btn.config(state='normal' if self.selected_index > 0 else 'disabled')
+        self.next_segment_btn.config(state='normal' if self.selected_index < n - 1 else 'disabled')
 
     # ------------------------------------------------------------- gating --
     def _current_segment(self) -> Optional[SegmentSettings]:
@@ -2322,6 +2402,199 @@ class StudioApp:
                          + (f" + {os.path.basename(bass_out)}" if bass_out else ""))
         messagebox.showinfo("Render complete", f"Drum: {drum_out}" +
                             (f"\nBass: {bass_out}" if bass_out else ""))
+
+    # -------------------------------------------------------------- session --
+    # A session file (.dbhproj) is a zip: session.json (segment settings, phase
+    # done-flags, groove-swap choices, source file paths) + files/ (whichever
+    # phase OUTPUTS and swapped-in grooves already exist, copied out of
+    # self.temp_dir - which is wiped on exit, so without this copy a save
+    # would silently point at files that no longer exist next launch). RAW
+    # slices (phase1_raw_path, bass_input_path) are NOT bundled - they're cheap
+    # to re-slice from the source files on load, unlike a Phase 1 output, which
+    # took a real model pass (with sampling randomness - re-running Phase 1
+    # from saved SETTINGS alone would not reliably reproduce the same result).
+    def _on_save_session(self):
+        if not self.segments and not self.drum_path:
+            messagebox.showinfo("Nothing to save", "Load a drum MIDI file first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save session as", defaultextension=SESSION_FILE_EXT,
+            filetypes=[("Drum+Bass Studio session", f"*{SESSION_FILE_EXT}")])
+        if not path:
+            return
+        try:
+            self._save_session_to(path)
+        except Exception as exc:
+            msg = _report_error(f"saving session to '{path}'", exc)
+            messagebox.showerror("Save failed", msg)
+            return
+        self._set_status(f"Session saved -> {os.path.basename(path)}")
+
+    def _save_session_to(self, path):
+        data = {
+            'version': SESSION_FILE_VERSION,
+            'drum_original_path': self.drum_original_path,
+            'bass_path': self.bass_path,
+            'seg_threshold': self.seg_threshold_var.get(),
+            'selected_index': self.selected_index,
+            'segments': [],
+        }
+        file_entries = []   # (arcname, actual path on disk right now)
+        for seg in self.segments:
+            entry = {
+                'index': seg.index, 'start_sec': seg.start_sec, 'end_sec': seg.end_sec,
+                'start_bar': seg.start_bar, 'end_bar': seg.end_bar,
+                'phase1_settings': seg.phase1_settings, 'phase1_done': seg.phase1_done,
+                'phase1_stale': seg.phase1_stale,
+                'phase2_settings': seg.phase2_settings, 'phase2_done': seg.phase2_done,
+                'phase2_stale': seg.phase2_stale,
+                'phase3_settings': seg.phase3_settings, 'phase3_done': seg.phase3_done,
+                'phase3_stale': seg.phase3_stale,
+                'swapped_groove_source': seg.swapped_groove_source,
+                'groove_results': seg.groove_results,
+            }
+            for field_name, arc_prefix in (('phase1_output_path', 'phase1'),
+                                           ('phase2_output_path', 'phase2'),
+                                           ('phase3_output_path', 'phase3'),
+                                           ('swapped_groove_path', 'swap')):
+                src = getattr(seg, field_name)
+                if src and os.path.exists(src):
+                    arcname = f"files/seg{seg.index}_{arc_prefix}{os.path.splitext(src)[1]}"
+                    file_entries.append((arcname, src))
+                    entry[field_name] = arcname
+                else:
+                    entry[field_name] = None
+            data['segments'].append(entry)
+
+        tmp_path = path + '.tmp'
+        try:
+            with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('session.json', json.dumps(data, indent=2))
+                for arcname, src in file_entries:
+                    zf.write(src, arcname)
+            os.replace(tmp_path, path)   # atomic - a reader never sees a half-written project
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _on_load_session(self):
+        path = filedialog.askopenfilename(
+            title="Load session", filetypes=[("Drum+Bass Studio session", f"*{SESSION_FILE_EXT}"),
+                                             ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            warnings = self._load_session_from(path)
+        except Exception as exc:
+            msg = _report_error(f"loading session '{path}'", exc)
+            messagebox.showerror("Load failed", msg)
+            return
+        msg = f"Session loaded ({len(self.segments)} segments)."
+        self._set_status(msg + (" See warnings." if warnings else ""))
+        if warnings:
+            messagebox.showwarning("Session loaded with warnings", "\n".join(warnings))
+
+    def _load_session_from(self, path) -> List[str]:
+        extract_dir = os.path.join(self.temp_dir, f"session_{uuid.uuid4().hex[:8]}")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(path, 'r') as zf:
+            data = json.loads(zf.read('session.json'))
+            zf.extractall(extract_dir)
+
+        warnings = []
+
+        # -- drum file: re-derive the forced temp copy fresh from the ORIGINAL
+        # path (the old temp copy is long gone - self.temp_dir is wiped on
+        # every exit) --
+        drum_original = data.get('drum_original_path')
+        self.drum_original_path = drum_original
+        if drum_original and os.path.exists(drum_original):
+            try:
+                self.drum_path = force_all_drums_to_temp(drum_original, self.temp_dir)
+                self.drum_drop.config(text=os.path.basename(drum_original), foreground='black')
+            except Exception as exc:
+                _report_error(f"restoring drum file '{drum_original}'", exc)
+                warnings.append(f"Could not reload the drum file: {drum_original}")
+                self.drum_path = None
+        else:
+            self.drum_path = None
+            self.drum_drop.config(text=self._drop_text("drum"), foreground='#555')
+            if drum_original:
+                warnings.append(f"Original drum file not found (moved or deleted?): {drum_original}")
+
+        # -- bass file (never temp-forced, so the saved path is usable directly
+        # if it still exists) --
+        bass_path = data.get('bass_path')
+        if bass_path and os.path.exists(bass_path):
+            self.bass_path = bass_path
+            self.bass_drop.config(text=os.path.basename(bass_path), foreground='black')
+        else:
+            self.bass_path = None
+            self.bass_drop.config(text=self._drop_text("bass"), foreground='#555')
+            if bass_path:
+                warnings.append(f"Bass file not found (moved or deleted?): {bass_path}")
+
+        if 'seg_threshold' in data:
+            self.seg_threshold_var.set(data['seg_threshold'])
+            self.seg_threshold_label.config(text=f"{data['seg_threshold']:.2f}")
+
+        segments = []
+        for entry in data.get('segments', []):
+            seg = SegmentSettings(index=entry['index'], start_sec=entry['start_sec'],
+                                  end_sec=entry['end_sec'], start_bar=entry['start_bar'],
+                                  end_bar=entry['end_bar'])
+            seg.phase1_settings = entry.get('phase1_settings') or default_phase1_settings()
+            seg.phase2_settings = entry.get('phase2_settings') or default_phase2_settings()
+            seg.phase3_settings = entry.get('phase3_settings') or default_phase3_settings()
+            seg.phase1_stale = entry.get('phase1_stale', False)
+            seg.phase2_stale = entry.get('phase2_stale', False)
+            seg.phase3_stale = entry.get('phase3_stale', False)
+            seg.swapped_groove_source = entry.get('swapped_groove_source')
+            seg.groove_results = entry.get('groove_results')
+
+            for field_name in ('phase1_output_path', 'phase2_output_path',
+                               'phase3_output_path', 'swapped_groove_path'):
+                arcname = entry.get(field_name)
+                if arcname:
+                    full = os.path.join(extract_dir, *arcname.split('/'))
+                    setattr(seg, field_name, full if os.path.exists(full) else None)
+
+            seg.phase1_done = bool(seg.phase1_output_path) and entry.get('phase1_done', False)
+            seg.phase2_done = bool(seg.phase2_output_path) and entry.get('phase2_done', False)
+            seg.phase3_done = bool(seg.phase3_output_path) and entry.get('phase3_done', False)
+
+            # Cheap to regenerate (a raw slice, no model involved) - restoring
+            # these means "Audition raw"/Phase 3's bass sync still work right
+            # away instead of only after the phase is re-run.
+            if self.drum_path and seg.phase1_done:
+                try:
+                    seg.phase1_raw_path = self._phase1_raw_input(seg)
+                except Exception as exc:
+                    _report_error(f"regenerating raw input for segment {seg.index+1}", exc)
+            if self.bass_path and seg.phase3_done:
+                try:
+                    seg.bass_input_path, _, _ = slice_midi_to_temp(
+                        self.bass_path, seg.start_sec, seg.end_sec, self.temp_dir, drums_only=False)
+                except Exception as exc:
+                    _report_error(f"regenerating raw bass input for segment {seg.index+1}", exc)
+
+            segments.append(seg)
+
+        self.segments = segments
+        self.selected_index = None
+        self._draw_timeline()
+        self._update_segment_nav_label()
+        self._refresh_gating()
+        self._refresh_groove_section(None)
+
+        sel = data.get('selected_index')
+        if sel is not None and 0 <= sel < len(self.segments):
+            self._on_segment_selected(sel)
+
+        return warnings
 
     # ---------------------------------------------------------------- close --
     def _on_close(self):
